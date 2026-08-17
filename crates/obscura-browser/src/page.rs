@@ -1378,7 +1378,11 @@ impl Page {
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            // Thread the page callbacks so on_response fires for the top-level
+            // document, same as subresources and the non-stealth path already do.
+            return stealth
+                .fetch_with_callbacks(url, Some(&self.callbacks))
+                .await;
         }
         self.http_client
             .fetch_with_callbacks(url, Some(&self.callbacks))

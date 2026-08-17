@@ -11,6 +11,7 @@ license = "Apache-2.0"
 default = ["api"]
 api = ["obscura-browser", "obscura-net", "tokio"]
 render = ["api", "obscura-browser/render"]
+stealth = ["api", "obscura-browser/stealth"]
 
 [dependencies]
 obscura-browser = { path = "../obscura-browser", optional = true }

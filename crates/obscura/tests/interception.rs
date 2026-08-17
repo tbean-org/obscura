@@ -258,3 +258,33 @@ async fn on_response_callback_can_be_detached() {
         "detached on_response callback must not fire after off_response"
     );
 }
+
+// Regression: the stealth transport must fire on_response for the top-level
+// document (its own main fetch previously dropped the page callback registry,
+// so callers could not observe the navigation's status). Subresources and the
+// non-stealth path already fire it; this pins the main-document parity.
+#[cfg(feature = "stealth")]
+#[tokio::test]
+async fn stealth_fires_on_response_for_main_document() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_echo_server();
+
+    let browser = Browser::builder().stealth(true).build().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+
+    let doc_status = Arc::new(AtomicU32::new(0));
+    let ds = doc_status.clone();
+    page.on_response(Arc::new(move |info, resp| {
+        if info.resource_type == ResourceType::Document {
+            ds.store(u32::from(resp.status), Ordering::SeqCst);
+        }
+    }));
+
+    page.goto(&base).await.unwrap();
+
+    assert_eq!(
+        doc_status.load(Ordering::SeqCst),
+        200,
+        "stealth did not fire on_response for the main document"
+    );
+}
