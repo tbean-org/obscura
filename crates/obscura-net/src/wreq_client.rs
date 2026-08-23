@@ -351,10 +351,11 @@ impl StealthHttpClient {
                 headers: self.extra_headers.read().await.clone(),
                 resource_type: request.resource_type,
             };
-            // Only intercept the originally requested URL, never a redirect target:
-            // a mid-chain Fulfill would return the cached body while discarding the
-            // transfer bytes already spent reaching it (Fulfill bypasses on_response).
-            if redirects.is_empty() {
+            // Only intercept the originally requested URL, never a redirect target
+            // (a mid-chain Fulfill would discard transfer bytes already spent), and
+            // never a CORS-enforced request: the URL-keyed cache can't prove the
+            // fulfilled response would pass CORS, so those always take the network.
+            if redirects.is_empty() && !cors_required(&request, &current_url) {
                 if let Some(interceptor) = self.interceptor.read().await.as_ref() {
                     match interceptor.intercept(&request_info).await {
                         InterceptAction::Continue => {}
