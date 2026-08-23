@@ -117,7 +117,7 @@ async fn read_wreq_body_limited(
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
     let mut body = Vec::with_capacity(capacity);
-    let mut received: u64 = 0;
+    let mut charged: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             ObscuraNetError::Network(format!("Failed to read body: {}", error))
@@ -125,20 +125,16 @@ async fn read_wreq_body_limited(
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
         }
-        // Count decoded bytes as they arrive, so a transfer cancelled or failed
-        // mid-body still reports what it pulled (reconciled to on-wire below).
-        received += chunk.len() as u64;
         if let Some(c) = counter {
-            c.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            charged += crate::client::count_chunk(c, chunk.len(), content_length, charged);
         }
         body.extend_from_slice(&chunk);
     }
-    if let (Some(c), Some(on_wire)) = (counter, on_wire) {
-        // Completed: correct the decoded running total to the on-wire size.
-        if on_wire >= received {
-            c.fetch_add(on_wire - received, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            c.fetch_sub(received - on_wire, std::sync::atomic::Ordering::Relaxed);
+    // Completed: top up to the exact on-wire total (compressed body + headers).
+    if let Some(c) = counter {
+        let target = on_wire.unwrap_or(charged + header_bytes);
+        if target > charged {
+            c.fetch_add(target - charged, std::sync::atomic::Ordering::Relaxed);
         }
     }
     Ok(body)

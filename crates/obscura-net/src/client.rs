@@ -94,6 +94,26 @@ pub struct Response {
 
 /// Best-effort on-wire size of one response: body (Content-Length if given,
 /// else decoded length) plus the serialized response headers.
+// Charge a decoded body chunk to the on-wire byte counter, capped so a request's
+// running body contribution never exceeds its compressed Content-Length — decoded
+// bytes overstate on-wire for gzip/br, so this bounds a partial (cancelled/failed)
+// compressed transfer to its true on-wire size. Returns the amount charged.
+pub(crate) fn count_chunk(
+    counter: &std::sync::atomic::AtomicU64,
+    chunk_len: usize,
+    content_length: Option<u64>,
+    charged: u64,
+) -> u64 {
+    let add = match content_length {
+        Some(cl) => (chunk_len as u64).min(cl.saturating_sub(charged)),
+        None => chunk_len as u64,
+    };
+    if add > 0 {
+        counter.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
+    }
+    add
+}
+
 pub fn wire_bytes(headers: &HashMap<String, String>, body_len: usize) -> u64 {
     let body = headers
         .get("content-length")
@@ -851,26 +871,23 @@ async fn read_reqwest_body_limited(
         .unwrap_or(0)
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
-    let mut received: u64 = 0;
+    let mut charged: u64 = 0;
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         ObscuraNetError::Network(format!("Failed to read body: {}", error))
     })? {
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
         }
-        // Count decoded bytes as they arrive so a cancelled/failed mid-body
-        // transfer is still counted (reconciled to on-wire below).
-        received += chunk.len() as u64;
         if let Some(c) = counter {
-            c.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            charged += count_chunk(c, chunk.len(), content_length, charged);
         }
         body.extend_from_slice(&chunk);
     }
-    if let (Some(c), Some(on_wire)) = (counter, on_wire) {
-        if on_wire >= received {
-            c.fetch_add(on_wire - received, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            c.fetch_sub(received - on_wire, std::sync::atomic::Ordering::Relaxed);
+    // Completed: top up to the exact on-wire total (compressed body + headers).
+    if let Some(c) = counter {
+        let target = on_wire.unwrap_or(charged + header_bytes);
+        if target > charged {
+            c.fetch_add(target - charged, std::sync::atomic::Ordering::Relaxed);
         }
     }
     Ok(body)
