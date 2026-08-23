@@ -29,4 +29,7 @@ pub use page::Page;
 
 // Request/response interception types (issue #306).
 pub use obscura_browser::{InterceptedRequest, InterceptResolution};
-pub use obscura_net::{RequestCallback, RequestInfo, ResourceType, Response, ResponseCallback};
+pub use obscura_net::{
+    InterceptAction, RequestCallback, RequestInfo, RequestInterceptor, ResourceType, Response,
+    ResponseCallback,
+};

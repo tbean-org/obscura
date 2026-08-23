@@ -85,6 +85,25 @@ pub struct Response {
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     pub redirected_from: Vec<Url>,
+    /// On-wire transfer size for this response: Content-Length when present
+    /// (the compressed body size), else the decoded body length, plus the
+    /// serialized response-header bytes, summed across any redirect hops.
+    /// Best-effort estimate of bytes that traversed the proxy.
+    pub transfer_bytes: u64,
+}
+
+/// Best-effort on-wire size of one response: body (Content-Length if given,
+/// else decoded length) plus the serialized response headers.
+pub fn wire_bytes(headers: &HashMap<String, String>, body_len: usize) -> u64 {
+    let body = headers
+        .get("content-length")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(body_len as u64);
+    let header_bytes: u64 = headers
+        .iter()
+        .map(|(k, v)| k.len() as u64 + v.len() as u64 + 4)
+        .sum();
+    body + header_bytes
 }
 
 impl Response {
@@ -735,6 +754,7 @@ pub(crate) async fn fetch_file_url(
         headers,
         body,
         redirected_from: Vec::new(),
+        transfer_bytes: 0,
     })
 }
 
@@ -836,7 +856,7 @@ pub struct ObscuraHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub user_agent: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
-    pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
+    pub interceptor: RwLock<Option<Arc<dyn RequestInterceptor + Send + Sync>>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
@@ -1383,6 +1403,7 @@ impl ObscuraHttpClient {
                         headers: HashMap::new(),
                         body: Vec::new(),
                         redirected_from: Vec::new(),
+                        transfer_bytes: 0,
                     });
                 }
             }
@@ -1390,6 +1411,7 @@ impl ObscuraHttpClient {
 
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
+        let mut transfer_acc: u64 = 0;
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
@@ -1584,6 +1606,7 @@ impl ObscuraHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    transfer_acc += wire_bytes(&response_headers, 0);
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     if status == reqwest::StatusCode::MOVED_PERMANENTLY
@@ -1605,12 +1628,14 @@ impl ObscuraHttpClient {
             .await?;
             drop(in_flight);
 
+            let transfer_bytes = transfer_acc + wire_bytes(&response_headers, body_bytes.len());
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
                 body: body_bytes,
                 redirected_from: redirects,
+                transfer_bytes,
             };
 
             if let Some(cbs) = callbacks {
@@ -1629,6 +1654,10 @@ impl ObscuraHttpClient {
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
         *self.extra_headers.write().await = headers;
+    }
+
+    pub async fn set_interceptor(&self, interceptor: Arc<dyn RequestInterceptor + Send + Sync>) {
+        *self.interceptor.write().await = Some(interceptor);
     }
 
     pub fn active_requests(&self) -> u32 {
