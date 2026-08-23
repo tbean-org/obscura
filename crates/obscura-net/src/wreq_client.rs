@@ -90,16 +90,24 @@ async fn read_wreq_body_limited(
     response: wreq::Response,
     url: &Url,
     limit: usize,
+    counter: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<Vec<u8>, ObscuraNetError> {
-    if response
+    let content_length = response
         .headers()
         .get("content-length")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .is_some_and(|length| length > limit as u64)
-    {
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if content_length.is_some_and(|length| length > limit as u64) {
         return Err(response_too_large(url, limit));
     }
+    // On-wire size to reconcile to once the body completes: compressed body
+    // (Content-Length) + serialized response headers. None when unknown.
+    let header_bytes: u64 = response
+        .headers()
+        .iter()
+        .map(|(k, v)| k.as_str().len() as u64 + v.as_bytes().len() as u64 + 4)
+        .sum();
+    let on_wire = content_length.map(|cl| cl + header_bytes);
 
     let capacity = response
         .content_length()
@@ -109,6 +117,7 @@ async fn read_wreq_body_limited(
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
     let mut body = Vec::with_capacity(capacity);
+    let mut received: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             ObscuraNetError::Network(format!("Failed to read body: {}", error))
@@ -116,7 +125,21 @@ async fn read_wreq_body_limited(
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
         }
+        // Count decoded bytes as they arrive, so a transfer cancelled or failed
+        // mid-body still reports what it pulled (reconciled to on-wire below).
+        received += chunk.len() as u64;
+        if let Some(c) = counter {
+            c.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         body.extend_from_slice(&chunk);
+    }
+    if let (Some(c), Some(on_wire)) = (counter, on_wire) {
+        // Completed: correct the decoded running total to the on-wire size.
+        if on_wire >= received {
+            c.fetch_add(on_wire - received, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            c.fetch_sub(received - on_wire, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Ok(body)
 }
@@ -146,6 +169,9 @@ pub struct StealthHttpClient {
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub interceptor: RwLock<Option<Arc<dyn RequestInterceptor + Send + Sync>>>,
+    // On-wire bytes received, incremented live per body chunk so partial
+    // (cancelled/failed) transfers are still counted. Set by the caller.
+    pub bytes_counter: RwLock<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 #[cfg(feature = "stealth")]
@@ -213,11 +239,16 @@ impl StealthHttpClient {
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             interceptor: RwLock::new(None),
+            bytes_counter: RwLock::new(None),
         }
     }
 
     pub async fn set_interceptor(&self, interceptor: Arc<dyn RequestInterceptor + Send + Sync>) {
         *self.interceptor.write().await = Some(interceptor);
+    }
+
+    pub async fn set_bytes_counter(&self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        *self.bytes_counter.write().await = Some(counter);
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -272,6 +303,7 @@ impl StealthHttpClient {
 
         let mut redirects = Vec::new();
         let mut transfer_acc: u64 = 0;
+        let counter = self.bytes_counter.read().await.clone();
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
@@ -391,15 +423,24 @@ impl StealthHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
-                    transfer_acc += crate::client::wire_bytes(&response_headers, 0);
+                    let hop = crate::client::wire_bytes(&response_headers, 0);
+                    transfer_acc += hop;
+                    if let Some(c) = &counter {
+                        c.fetch_add(hop, std::sync::atomic::Ordering::Relaxed);
+                    }
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     continue;
                 }
             }
 
-            let body = read_wreq_body_limited(resp, &current_url, request.max_response_bytes)
-                .await?;
+            let body = read_wreq_body_limited(
+                resp,
+                &current_url,
+                request.max_response_bytes,
+                counter.as_deref(),
+            )
+            .await?;
             drop(in_flight);
 
             let transfer_bytes = transfer_acc + crate::client::wire_bytes(&response_headers, body.len());
@@ -485,7 +526,9 @@ impl StealthHttpClient {
             .iter()
             .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let resp_body = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
+        let counter = self.bytes_counter.read().await.clone();
+        let resp_body =
+            read_wreq_body_limited(resp, url, 64 * 1024 * 1024, counter.as_deref()).await?;
         drop(in_flight);
 
         let transfer_bytes = crate::client::wire_bytes(&response_headers, resp_body.len());
@@ -599,6 +642,7 @@ mod tests {
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             interceptor: tokio::sync::RwLock::new(None),
+            bytes_counter: tokio::sync::RwLock::new(None),
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client

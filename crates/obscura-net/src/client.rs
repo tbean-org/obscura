@@ -831,21 +831,47 @@ async fn read_reqwest_body_limited(
     mut response: reqwest::Response,
     url: &Url,
     limit: usize,
+    counter: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<Vec<u8>, ObscuraNetError> {
     reject_oversized_content_length(response.headers(), url, limit)?;
+    let content_length = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let header_bytes: u64 = response
+        .headers()
+        .iter()
+        .map(|(k, v)| k.as_str().len() as u64 + v.as_bytes().len() as u64 + 4)
+        .sum();
+    let on_wire = content_length.map(|cl| cl + header_bytes);
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(0)
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
+    let mut received: u64 = 0;
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         ObscuraNetError::Network(format!("Failed to read body: {}", error))
     })? {
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
         }
+        // Count decoded bytes as they arrive so a cancelled/failed mid-body
+        // transfer is still counted (reconciled to on-wire below).
+        received += chunk.len() as u64;
+        if let Some(c) = counter {
+            c.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         body.extend_from_slice(&chunk);
+    }
+    if let (Some(c), Some(on_wire)) = (counter, on_wire) {
+        if on_wire >= received {
+            c.fetch_add(on_wire - received, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            c.fetch_sub(received - on_wire, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Ok(body)
 }
@@ -857,6 +883,9 @@ pub struct ObscuraHttpClient {
     pub user_agent: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Arc<dyn RequestInterceptor + Send + Sync>>>,
+    // On-wire bytes received, incremented live per body chunk so partial
+    // (cancelled/failed) transfers are still counted. Set by the caller.
+    pub bytes_counter: RwLock<Option<Arc<std::sync::atomic::AtomicU64>>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
@@ -1070,6 +1099,7 @@ impl ObscuraHttpClient {
             ),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
+            bytes_counter: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
@@ -1412,6 +1442,7 @@ impl ObscuraHttpClient {
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
         let mut transfer_acc: u64 = 0;
+        let counter = self.bytes_counter.read().await.clone();
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
@@ -1611,7 +1642,11 @@ impl ObscuraHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
-                    transfer_acc += wire_bytes(&response_headers, 0);
+                    let hop = wire_bytes(&response_headers, 0);
+                    transfer_acc += hop;
+                    if let Some(c) = &counter {
+                        c.fetch_add(hop, std::sync::atomic::Ordering::Relaxed);
+                    }
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     if status == reqwest::StatusCode::MOVED_PERMANENTLY
@@ -1629,6 +1664,7 @@ impl ObscuraHttpClient {
                 resp,
                 &current_url,
                 request.max_response_bytes,
+                counter.as_deref(),
             )
             .await?;
             drop(in_flight);
@@ -1663,6 +1699,10 @@ impl ObscuraHttpClient {
 
     pub async fn set_interceptor(&self, interceptor: Arc<dyn RequestInterceptor + Send + Sync>) {
         *self.interceptor.write().await = Some(interceptor);
+    }
+
+    pub async fn set_bytes_counter(&self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        *self.bytes_counter.write().await = Some(counter);
     }
 
     pub fn active_requests(&self) -> u32 {
