@@ -1425,18 +1425,23 @@ impl ObscuraHttpClient {
                 resource_type: request.resource_type.clone(),
             };
 
-            if let Some(interceptor) = self.interceptor.read().await.as_ref() {
-                match interceptor.intercept(&request_info).await {
-                    InterceptAction::Continue => {}
-                    InterceptAction::Block => {
-                        return Err(ObscuraNetError::Blocked(current_url.to_string()));
-                    }
-                    InterceptAction::Fulfill(response) => {
-                        return Ok(response);
-                    }
-                    InterceptAction::ModifyHeaders(headers) => {
-                        let mut extra = self.extra_headers.write().await;
-                        extra.extend(headers);
+            // Only intercept the originally requested URL, never a redirect target:
+            // a mid-chain Fulfill would drop the transfer bytes already spent
+            // reaching it (Fulfill bypasses on_response).
+            if redirects.is_empty() {
+                if let Some(interceptor) = self.interceptor.read().await.as_ref() {
+                    match interceptor.intercept(&request_info).await {
+                        InterceptAction::Continue => {}
+                        InterceptAction::Block => {
+                            return Err(ObscuraNetError::Blocked(current_url.to_string()));
+                        }
+                        InterceptAction::Fulfill(response) => {
+                            return Ok(response);
+                        }
+                        InterceptAction::ModifyHeaders(headers) => {
+                            let mut extra = self.extra_headers.write().await;
+                            extra.extend(headers);
+                        }
                     }
                 }
             }
