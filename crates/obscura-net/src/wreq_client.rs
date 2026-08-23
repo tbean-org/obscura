@@ -319,17 +319,22 @@ impl StealthHttpClient {
                 headers: self.extra_headers.read().await.clone(),
                 resource_type: request.resource_type,
             };
-            if let Some(interceptor) = self.interceptor.read().await.as_ref() {
-                match interceptor.intercept(&request_info).await {
-                    InterceptAction::Continue => {}
-                    InterceptAction::Block => {
-                        return Err(ObscuraNetError::Blocked(current_url.to_string()));
-                    }
-                    // Served from the external cache: no network round trip and no
-                    // on_response fire, so byte accounting counts it as cache, not proxy.
-                    InterceptAction::Fulfill(response) => return Ok(response),
-                    InterceptAction::ModifyHeaders(headers) => {
-                        self.extra_headers.write().await.extend(headers);
+            // Only intercept the originally requested URL, never a redirect target:
+            // a mid-chain Fulfill would return the cached body while discarding the
+            // transfer bytes already spent reaching it (Fulfill bypasses on_response).
+            if redirects.is_empty() {
+                if let Some(interceptor) = self.interceptor.read().await.as_ref() {
+                    match interceptor.intercept(&request_info).await {
+                        InterceptAction::Continue => {}
+                        InterceptAction::Block => {
+                            return Err(ObscuraNetError::Blocked(current_url.to_string()));
+                        }
+                        // Served from the external cache: no network round trip and no
+                        // on_response fire, so accounting counts it as cache, not proxy.
+                        InterceptAction::Fulfill(response) => return Ok(response),
+                        InterceptAction::ModifyHeaders(headers) => {
+                            self.extra_headers.write().await.extend(headers);
+                        }
                     }
                 }
             }
