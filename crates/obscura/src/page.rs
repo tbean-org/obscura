@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use obscura_browser::lifecycle::WaitUntil;
 use obscura_browser::{InterceptedRequest, Page as InnerPage};
-use obscura_net::{RequestCallback, ResponseCallback};
+use obscura_net::{RequestCallback, RequestInterceptor, ResponseCallback};
 use serde_json::Value;
 
 use crate::error::Error;
@@ -139,6 +139,23 @@ impl Page {
     /// or block. Returns a stable id; pass it to `off_request` to detach.
     pub fn on_request(&mut self, cb: RequestCallback) -> u64 {
         self.inner.get_mut().on_request(cb)
+    }
+
+    /// Install a request interceptor (both transports) so an external cache can
+    /// serve requests before they hit the network; also disables the in-process
+    /// resource cache. Call before `goto`.
+    pub async fn set_interceptor(
+        &self,
+        interceptor: std::sync::Arc<dyn RequestInterceptor + Send + Sync>,
+    ) {
+        let (http, stealth) = {
+            let inner = self.inner.borrow();
+            (inner.http_client.clone(), inner.stealth_client.clone())
+        };
+        http.set_interceptor(interceptor.clone()).await;
+        if let Some(stealth) = stealth {
+            stealth.set_interceptor(interceptor).await;
+        }
     }
 
     /// Register a passive callback fired with every response the page receives

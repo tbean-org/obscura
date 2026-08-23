@@ -17,6 +17,8 @@ use url::Url;
 #[cfg(feature = "stealth")]
 use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
+use crate::interceptor::{InterceptAction, RequestInterceptor};
+#[cfg(feature = "stealth")]
 use crate::client::{
     CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
     ResourceRequest, Response, cors_required, fetch_file_url, redirect_taints_origin,
@@ -143,6 +145,7 @@ pub struct StealthHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    pub interceptor: RwLock<Option<Arc<dyn RequestInterceptor + Send + Sync>>>,
 }
 
 #[cfg(feature = "stealth")]
@@ -209,7 +212,12 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            interceptor: RwLock::new(None),
         }
+    }
+
+    pub async fn set_interceptor(&self, interceptor: Arc<dyn RequestInterceptor + Send + Sync>) {
+        *self.interceptor.write().await = Some(interceptor);
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -257,11 +265,13 @@ impl StealthHttpClient {
                     headers: HashMap::new(),
                     body: Vec::new(),
                     redirected_from: Vec::new(),
+                    transfer_bytes: 0,
                 });
             }
         }
 
         let mut redirects = Vec::new();
+        let mut transfer_acc: u64 = 0;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
@@ -309,6 +319,20 @@ impl StealthHttpClient {
                 headers: self.extra_headers.read().await.clone(),
                 resource_type: request.resource_type,
             };
+            if let Some(interceptor) = self.interceptor.read().await.as_ref() {
+                match interceptor.intercept(&request_info).await {
+                    InterceptAction::Continue => {}
+                    InterceptAction::Block => {
+                        return Err(ObscuraNetError::Blocked(current_url.to_string()));
+                    }
+                    // Served from the external cache: no network round trip and no
+                    // on_response fire, so byte accounting counts it as cache, not proxy.
+                    InterceptAction::Fulfill(response) => return Ok(response),
+                    InterceptAction::ModifyHeaders(headers) => {
+                        self.extra_headers.write().await.extend(headers);
+                    }
+                }
+            }
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
                     callbacks.fire_request(&request_info).await;
@@ -362,6 +386,7 @@ impl StealthHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    transfer_acc += crate::client::wire_bytes(&response_headers, 0);
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     continue;
@@ -372,12 +397,14 @@ impl StealthHttpClient {
                 .await?;
             drop(in_flight);
 
+            let transfer_bytes = transfer_acc + crate::client::wire_bytes(&response_headers, body.len());
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
                 body,
                 redirected_from: redirects,
+                transfer_bytes,
             };
             if let Some(callbacks) = callbacks {
                 callbacks.fire_response(&request_info, &response).await;
@@ -409,6 +436,7 @@ impl StealthHttpClient {
                     headers: HashMap::new(),
                     body: Vec::new(),
                     redirected_from: Vec::new(),
+                    transfer_bytes: 0,
                 });
             }
         }
@@ -455,12 +483,14 @@ impl StealthHttpClient {
         let resp_body = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
         drop(in_flight);
 
+        let transfer_bytes = crate::client::wire_bytes(&response_headers, resp_body.len());
         Ok(Response {
             url: url.clone(),
             status: status.as_u16(),
             headers: response_headers,
             body: resp_body,
             redirected_from: Vec::new(),
+            transfer_bytes,
         })
     }
 
@@ -563,6 +593,7 @@ mod tests {
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            interceptor: tokio::sync::RwLock::new(None),
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client

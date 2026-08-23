@@ -2707,12 +2707,14 @@ fn fetch_response(
     headers: HashMap<String, String>,
     body: Vec<u8>,
 ) -> Response {
+    let transfer_bytes = obscura_net::wire_bytes(&headers, body.len());
     Response {
         url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
         status,
         headers,
         body,
         redirected_from: Vec::new(),
+        transfer_bytes,
     }
 }
 

@@ -2016,6 +2016,7 @@ impl Page {
                             headers,
                             body,
                             redirected_from: Vec::new(),
+                            transfer_bytes: 0,
                         };
                         return Some((idx, url, resp));
                     }
@@ -2876,6 +2877,7 @@ impl Page {
                 headers,
                 body: body_bytes,
                 redirected_from: Vec::new(),
+                transfer_bytes: 0,
             })
         } else if method == "POST" {
             self.http_client
