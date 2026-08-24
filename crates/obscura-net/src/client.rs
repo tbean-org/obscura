@@ -195,6 +195,62 @@ pub fn wire_bytes(headers: &HashMap<String, String>, body_len: usize) -> u64 {
     body + header_bytes
 }
 
+// Decode a fully-read body per its Content-Encoding (applied in reverse order,
+// as encodings are listed in application order). The transports fetch raw
+// bytes with client decoders disabled so the wire counter sees the true
+// compressed stream; this is the single decode point before the body reaches
+// the parser. Unknown encodings pass through undecoded, as before.
+pub(crate) fn decode_body(
+    content_encoding: Option<&str>,
+    body: Vec<u8>,
+    url: &Url,
+    limit: usize,
+) -> Result<Vec<u8>, ObscuraNetError> {
+    fn read_all<R: std::io::Read>(mut r: R, url: &Url) -> Result<Vec<u8>, ObscuraNetError> {
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).map_err(|e| {
+            ObscuraNetError::Network(format!("{url}: failed to decode response body: {e}"))
+        })?;
+        Ok(out)
+    }
+
+    let Some(encoding) = content_encoding else {
+        return Ok(body);
+    };
+    let mut body = body;
+    let mut decoded_any = false;
+    for enc in encoding.split(',').rev() {
+        match enc.trim().to_ascii_lowercase().as_str() {
+            "" | "identity" => {}
+            "gzip" => {
+                body = read_all(flate2::read::GzDecoder::new(&body[..]), url)?;
+                decoded_any = true;
+            }
+            "deflate" => {
+                body = read_all(flate2::read::ZlibDecoder::new(&body[..]), url)?;
+                decoded_any = true;
+            }
+            "br" => {
+                body = read_all(brotli::Decompressor::new(&body[..], 4096), url)?;
+                decoded_any = true;
+            }
+            "zstd" => {
+                body = zstd::decode_all(&body[..]).map_err(|e| {
+                    ObscuraNetError::Network(format!("{url}: failed to decode response body: {e}"))
+                })?;
+                decoded_any = true;
+            }
+            _ => {}
+        }
+    }
+    // The stream limit was enforced on the compressed bytes; enforce it on
+    // the decoded size too so a small archive cannot expand past the cap.
+    if decoded_any && body.len() > limit {
+        return Err(response_too_large(url, limit));
+    }
+    Ok(body)
+}
+
 impl Response {
     /// Decode the body as text, honoring the response charset.
     ///
@@ -934,12 +990,12 @@ async fn read_reqwest_body_limited(
         .iter()
         .map(|(k, v)| k.as_str().len() as u64 + v.as_bytes().len() as u64 + 4)
         .sum();
-    let compressed = is_compressed(
-        response
-            .headers()
-            .get("content-encoding")
-            .and_then(|v| v.to_str().ok()),
-    );
+    let content_encoding = response
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let compressed = is_compressed(content_encoding.as_deref());
     let mut wire = WireCounter::new(content_length, header_bytes, compressed);
     let capacity = response
         .content_length()
@@ -964,7 +1020,7 @@ async fn read_reqwest_body_limited(
     if let Some(c) = counter {
         wire.on_complete(c, estimate);
     }
-    Ok(body)
+    decode_body(content_encoding.as_deref(), body, url, limit)
 }
 
 // A response is compressed when Content-Encoding is present and not `identity`.
@@ -976,6 +1032,11 @@ pub(crate) fn is_compressed(content_encoding: Option<&str>) -> bool {
 
 pub struct ObscuraHttpClient {
     client: tokio::sync::OnceCell<Client>,
+    // Transparent decompression strips Content-Length/Content-Encoding before
+    // the wire counter can see them, so resource fetches use a decoder-less
+    // client and decode locally after counting. The shared client above keeps
+    // auto-decode for scripted fetch (request_client), which is not counted.
+    raw_client: tokio::sync::OnceCell<Client>,
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
     pub user_agent: RwLock<String>,
@@ -1193,6 +1254,7 @@ impl ObscuraHttpClient {
     ) -> Self {
         ObscuraHttpClient {
             client: tokio::sync::OnceCell::new(),
+            raw_client: tokio::sync::OnceCell::new(),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
             user_agent: RwLock::new(
@@ -1210,32 +1272,51 @@ impl ObscuraHttpClient {
         }
     }
 
+    fn client_builder(&self, decode: bool) -> reqwest::ClientBuilder {
+        let mut builder = Client::builder()
+            .redirect(Policy::none())
+            .timeout(self.timeout)
+            .danger_accept_invalid_certs(false)
+            // SSRF guard: reject hostnames that resolve to a private/loopback IP.
+            .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)));
+        if !decode {
+            builder = builder.no_gzip().no_brotli().no_deflate();
+        }
+
+        if std::env::var_os("SSL_CERT_FILE").is_some()
+            || std::env::var_os("SSL_CERT_DIR").is_some()
+        {
+            for certificate in configured_root_certificates() {
+                builder = builder.add_root_certificate(certificate.clone());
+            }
+        }
+
+        if let Some(ref proxy) = self.proxy_url {
+            if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
+                builder = builder.proxy(p);
+            }
+        }
+        builder
+    }
+
     async fn get_client(&self) -> &Client {
-        self.client.get_or_init(|| async {
-            let mut builder = Client::builder()
-                .redirect(Policy::none())
-                .timeout(self.timeout)
-                .danger_accept_invalid_certs(false)
-                // SSRF guard: reject hostnames that resolve to a private/loopback IP.
-                .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
-;
+        self.client
+            .get_or_init(|| async {
+                self.client_builder(true)
+                    .build()
+                    .expect("failed to build HTTP client")
+            })
+            .await
+    }
 
-            if std::env::var_os("SSL_CERT_FILE").is_some()
-                || std::env::var_os("SSL_CERT_DIR").is_some()
-            {
-                for certificate in configured_root_certificates() {
-                    builder = builder.add_root_certificate(certificate.clone());
-                }
-            }
-
-            if let Some(ref proxy) = self.proxy_url {
-                if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
-                    builder = builder.proxy(p);
-                }
-            }
-
-            builder.build().expect("failed to build HTTP client")
-        }).await
+    async fn get_raw_client(&self) -> &Client {
+        self.raw_client
+            .get_or_init(|| async {
+                self.client_builder(false)
+                    .build()
+                    .expect("failed to build raw HTTP client")
+            })
+            .await
     }
 
     /// Clone the request client owned by this browser context.
@@ -1693,8 +1774,16 @@ impl ObscuraHttpClient {
             } else {
                 headers.remove(reqwest::header::ORIGIN);
             }
+            // The raw client has no decoders, so it would not advertise
+            // Accept-Encoding on its own; real Chrome always sends it.
+            if !headers.contains_key(reqwest::header::ACCEPT_ENCODING) {
+                headers.insert(
+                    reqwest::header::ACCEPT_ENCODING,
+                    HeaderValue::from_static("gzip, deflate, br"),
+                );
+            }
 
-            let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
+            let mut req_builder = self.get_raw_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
 
             if let Some(ref b) = body {
@@ -1775,6 +1864,15 @@ impl ObscuraHttpClient {
             drop(in_flight);
 
             let transfer_bytes = transfer_acc + wire_bytes(&response_headers, body_bytes.len());
+            // The body is decoded now, so Content-Length/Content-Encoding no
+            // longer describe it; drop them from the headers consumers see,
+            // as transparent decompression did. transfer_bytes above still
+            // uses the original compressed Content-Length.
+            let mut response_headers = response_headers;
+            if response_headers.contains_key("content-encoding") {
+                response_headers.remove("content-encoding");
+                response_headers.remove("content-length");
+            }
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
@@ -2819,3 +2917,181 @@ mod cert_env_tests {
         ));
     }
 }
+
+    // Integration tests for on-wire byte accounting over a live socket, the
+    // reqwest-transport mirror of wreq_client::tests::wire_accounting.
+    #[cfg(test)]
+    mod wire_accounting {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use url::Url;
+
+        use crate::client::{ObscuraHttpClient, ResourceRequest, ResourceType};
+        use crate::cookies::CookieJar;
+
+        const PLAIN_BODY: &str =
+            "<!DOCTYPE html><html><body><p id=\"mark\">gzip ok</p></body></html>";
+        const GZIP_BODY: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0xb3, 0x51, 0x74, 0xf1,
+            0x77, 0x0e, 0x89, 0x0c, 0x70, 0x55, 0xc8, 0x28, 0xc9, 0xcd, 0xb1, 0xb3, 0x81, 0x90,
+            0x49, 0xf9, 0x29, 0x95, 0x76, 0x36, 0x05, 0x0a, 0x99, 0x29, 0xb6, 0x4a, 0xb9, 0x89,
+            0x45, 0xd9, 0x4a, 0x76, 0xe9, 0x55, 0x99, 0x05, 0x0a, 0xf9, 0xd9, 0x36, 0xfa, 0x05,
+            0x76, 0x36, 0xfa, 0x10, 0x69, 0x7d, 0xb0, 0x5a, 0x00, 0x80, 0x3d, 0x1c, 0x5f, 0x41,
+            0x00, 0x00, 0x00,
+        ];
+
+        async fn raw_fixture(responses: Vec<Vec<u8>>) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                for response in responses {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            port
+        }
+
+        fn header_sum(head: &str) -> u64 {
+            head.lines()
+                .filter(|line| line.contains(':'))
+                .map(|line| {
+                    let (name, value) = line.split_once(':').unwrap();
+                    name.len() as u64 + value.trim().len() as u64 + 4
+                })
+                .sum()
+        }
+
+        async fn client_with_counters() -> (ObscuraHttpClient, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let client =
+                ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+            let bytes = Arc::new(AtomicU64::new(0));
+            let estimate = Arc::new(AtomicU64::new(0));
+            client.set_bytes_counter(Arc::clone(&bytes)).await;
+            client.set_estimate_counter(Arc::clone(&estimate)).await;
+            (client, bytes, estimate)
+        }
+
+        fn gzip_head() -> String {
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                GZIP_BODY.len()
+            )
+        }
+
+        #[tokio::test]
+        async fn reqwest_gzip_complete_charges_compressed_length_not_decoded() {
+            let head = gzip_head();
+            let mut raw = head.clone().into_bytes();
+            raw.extend_from_slice(GZIP_BODY);
+            let port = raw_fixture(vec![raw]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+            let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+            let resp = client.fetch_resource_with_callbacks(
+                &url,
+                ResourceRequest::navigation(),
+                None,
+            ).await.unwrap();
+            assert_eq!(resp.text(), PLAIN_BODY);
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + GZIP_BODY.len() as u64,
+                "compressed on-wire length charged, not the decoded length"
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
+        async fn reqwest_gzip_cut_short_charges_full_content_length_and_flags() {
+            let head = gzip_head();
+            let mut raw = head.clone().into_bytes();
+            raw.extend_from_slice(&GZIP_BODY[..GZIP_BODY.len() / 2]);
+            let port = raw_fixture(vec![raw]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+            let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+            let result = client
+                .fetch_resource_with_callbacks(&url, ResourceRequest::navigation(), None)
+                .await;
+            assert!(result.is_err(), "truncated body must fail the fetch");
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + GZIP_BODY.len() as u64
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
+        async fn reqwest_uncompressed_complete_counts_exact_on_wire_bytes() {
+            let body = "var x = 1;".repeat(50);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/javascript\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let raw = format!("{head}{body}").into_bytes();
+            let port = raw_fixture(vec![raw]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+            let url = Url::parse(&format!("http://127.0.0.1:{port}/app.js")).unwrap();
+
+            let resp = client
+                .fetch_resource_with_callbacks(&url, ResourceRequest::navigation(), None)
+                .await
+                .unwrap();
+            assert_eq!(resp.body.len(), body.len());
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + body.len() as u64
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
+        async fn reqwest_font_subresource_also_counts() {
+            let body = b"font-bytes".repeat(10);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\naccess-control-allow-origin: *\r\ncontent-type: font/woff2\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut raw = head.clone().into_bytes();
+            raw.extend_from_slice(&body);
+            let port = raw_fixture(vec![raw]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+            let url = Url::parse(&format!("http://127.0.0.1:{port}/font.woff2")).unwrap();
+            let initiator = Url::parse("http://127.0.0.1:1/page").unwrap();
+
+            let resp = client
+                .fetch_resource_with_callbacks(
+                    &url,
+                    ResourceRequest::subresource(ResourceType::Font, &initiator),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.body.len(), body.len());
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + body.len() as u64
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        }
+    }
