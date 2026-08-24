@@ -93,18 +93,20 @@ pub struct Response {
 }
 
 // Accumulates on-wire bytes for one response into a shared counter as its body
-// is read. The counter must reflect bytes that crossed the proxy, but the HTTP
-// client hands us DECODED chunks, so decoded bytes are used only for an
-// uncompressed body (where decoded == on-wire). For a compressed body we never
-// count decoded bytes: we charge Content-Length (the compressed size) once, so a
-// completed transfer is exact and a partial/failed one overcounts at most to the
-// full compressed size. Response headers are counted once (they cross first).
+// is read. The HTTP client hands us DECODED chunks, so decoded bytes are used
+// only for an uncompressed body (decoded == on-wire, exact even for a partial).
+// For a compressed body we never count decoded bytes; we charge Content-Length
+// (the compressed size) once — exact when the transfer completes, an upper bound
+// if it is cancelled/failed mid-body. Such upper-bound (and unmeasurable, i.e.
+// compressed with no Content-Length) cases increment the `estimate` counter while
+// pending and clear it only once confirmed exact, so the caller can mark the
+// total as an estimate. Response headers are charged once, at start.
 pub(crate) struct WireCounter {
     content_length: Option<u64>,
     header_bytes: u64,
     compressed: bool,
     body_charged: u64,
-    headers_charged: bool,
+    estimate_pending: bool,
 }
 
 impl WireCounter {
@@ -114,24 +116,30 @@ impl WireCounter {
             header_bytes,
             compressed,
             body_charged: 0,
-            headers_charged: false,
+            estimate_pending: false,
         }
     }
 
-    fn charge_headers(&mut self, counter: &std::sync::atomic::AtomicU64) {
-        if !self.headers_charged {
-            counter.fetch_add(self.header_bytes, std::sync::atomic::Ordering::Relaxed);
-            self.headers_charged = true;
+    /// Call once when the response is received, before reading the body. Charges
+    /// header bytes (so a fail-before-body still counts them) and, for a
+    /// compressed body, marks the total an estimate until completion confirms it.
+    pub(crate) fn on_start(
+        &mut self,
+        counter: &std::sync::atomic::AtomicU64,
+        estimate: Option<&std::sync::atomic::AtomicU64>,
+    ) {
+        counter.fetch_add(self.header_bytes, std::sync::atomic::Ordering::Relaxed);
+        if self.compressed {
+            if let Some(e) = estimate {
+                e.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.estimate_pending = true;
         }
     }
 
     /// Call per decoded body chunk received.
     pub(crate) fn on_chunk(&mut self, counter: &std::sync::atomic::AtomicU64, chunk_len: usize) {
-        self.charge_headers(counter);
         if self.compressed {
-            // Never count decoded bytes for a compressed body; charge the
-            // compressed Content-Length once. No Content-Length -> body unknown,
-            // count nothing (don't fabricate from decoded length).
             if self.body_charged == 0 {
                 if let Some(cl) = self.content_length {
                     counter.fetch_add(cl, std::sync::atomic::Ordering::Relaxed);
@@ -149,10 +157,11 @@ impl WireCounter {
     }
 
     /// Call once after the body fully completes.
-    pub(crate) fn on_complete(&mut self, counter: &std::sync::atomic::AtomicU64) {
-        self.charge_headers(counter);
-        // Uncompressed with a Content-Length larger than the decoded bytes seen
-        // (unusual) tops up to it; compressed already charged Content-Length.
+    pub(crate) fn on_complete(
+        &mut self,
+        counter: &std::sync::atomic::AtomicU64,
+        estimate: Option<&std::sync::atomic::AtomicU64>,
+    ) {
         if !self.compressed {
             if let Some(cl) = self.content_length {
                 if cl > self.body_charged {
@@ -161,6 +170,13 @@ impl WireCounter {
                     self.body_charged = cl;
                 }
             }
+        } else if self.estimate_pending && self.content_length.is_some() {
+            // Completed with a Content-Length: the full compressed body crossed
+            // the wire, so the charged Content-Length is now exact, not an estimate.
+            if let Some(e) = estimate {
+                e.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.estimate_pending = false;
         }
     }
 }
@@ -905,6 +921,7 @@ async fn read_reqwest_body_limited(
     url: &Url,
     limit: usize,
     counter: Option<&std::sync::atomic::AtomicU64>,
+    estimate: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<Vec<u8>, ObscuraNetError> {
     reject_oversized_content_length(response.headers(), url, limit)?;
     let content_length = response
@@ -930,6 +947,9 @@ async fn read_reqwest_body_limited(
         .unwrap_or(0)
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
+    if let Some(c) = counter {
+        wire.on_start(c, estimate);
+    }
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         ObscuraNetError::Network(format!("Failed to read body: {}", error))
     })? {
@@ -942,7 +962,7 @@ async fn read_reqwest_body_limited(
         body.extend_from_slice(&chunk);
     }
     if let Some(c) = counter {
-        wire.on_complete(c);
+        wire.on_complete(c, estimate);
     }
     Ok(body)
 }
@@ -964,6 +984,9 @@ pub struct ObscuraHttpClient {
     // On-wire bytes received, incremented live per body chunk so partial
     // (cancelled/failed) transfers are still counted. Set by the caller.
     pub bytes_counter: RwLock<Option<Arc<std::sync::atomic::AtomicU64>>>,
+    // Non-zero while any counted transfer's on-wire total is an estimate/upper
+    // bound (a pending or unmeasurable compressed body). Set by the caller.
+    pub estimate_counter: RwLock<Option<Arc<std::sync::atomic::AtomicU64>>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
@@ -1178,6 +1201,7 @@ impl ObscuraHttpClient {
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             bytes_counter: RwLock::new(None),
+            estimate_counter: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
@@ -1521,6 +1545,7 @@ impl ObscuraHttpClient {
         let mut redirects = Vec::new();
         let mut transfer_acc: u64 = 0;
         let counter = self.bytes_counter.read().await.clone();
+        let estimate = self.estimate_counter.read().await.clone();
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
@@ -1744,6 +1769,7 @@ impl ObscuraHttpClient {
                 &current_url,
                 request.max_response_bytes,
                 counter.as_deref(),
+                estimate.as_deref(),
             )
             .await?;
             drop(in_flight);
@@ -1782,6 +1808,10 @@ impl ObscuraHttpClient {
 
     pub async fn set_bytes_counter(&self, counter: Arc<std::sync::atomic::AtomicU64>) {
         *self.bytes_counter.write().await = Some(counter);
+    }
+
+    pub async fn set_estimate_counter(&self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        *self.estimate_counter.write().await = Some(counter);
     }
 
     pub fn active_requests(&self) -> u32 {

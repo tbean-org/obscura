@@ -171,6 +171,19 @@ impl Page {
         }
     }
 
+    /// Install a shared counter that is non-zero whenever `network_bytes` includes
+    /// an estimate/upper-bound (a pending or unmeasurable compressed transfer).
+    pub async fn set_estimate_counter(&self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        let (http, stealth) = {
+            let inner = self.inner.borrow();
+            (inner.http_client.clone(), inner.stealth_client.clone())
+        };
+        http.set_estimate_counter(counter.clone()).await;
+        if let Some(stealth) = stealth {
+            stealth.set_estimate_counter(counter).await;
+        }
+    }
+
     /// Register a passive callback fired with every response the page receives
     /// (navigation and JS `fetch()`/XHR), including its body. Non-blocking. The
     /// main path for capturing API response payloads from SPAs. Returns a stable
