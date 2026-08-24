@@ -91,6 +91,7 @@ async fn read_wreq_body_limited(
     url: &Url,
     limit: usize,
     counter: Option<&std::sync::atomic::AtomicU64>,
+    estimate: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<Vec<u8>, ObscuraNetError> {
     let content_length = response
         .headers()
@@ -121,6 +122,9 @@ async fn read_wreq_body_limited(
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
     let mut body = Vec::with_capacity(capacity);
+    if let Some(c) = counter {
+        wire.on_start(c, estimate);
+    }
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             ObscuraNetError::Network(format!("Failed to read body: {}", error))
@@ -134,7 +138,7 @@ async fn read_wreq_body_limited(
         body.extend_from_slice(&chunk);
     }
     if let Some(c) = counter {
-        wire.on_complete(c);
+        wire.on_complete(c, estimate);
     }
     Ok(body)
 }
@@ -167,6 +171,9 @@ pub struct StealthHttpClient {
     // On-wire bytes received, incremented live per body chunk so partial
     // (cancelled/failed) transfers are still counted. Set by the caller.
     pub bytes_counter: RwLock<Option<Arc<std::sync::atomic::AtomicU64>>>,
+    // Non-zero while any counted transfer's on-wire total is an estimate/upper
+    // bound (a pending or unmeasurable compressed body). Set by the caller.
+    pub estimate_counter: RwLock<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 #[cfg(feature = "stealth")]
@@ -235,6 +242,7 @@ impl StealthHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             interceptor: RwLock::new(None),
             bytes_counter: RwLock::new(None),
+            estimate_counter: RwLock::new(None),
         }
     }
 
@@ -244,6 +252,10 @@ impl StealthHttpClient {
 
     pub async fn set_bytes_counter(&self, counter: Arc<std::sync::atomic::AtomicU64>) {
         *self.bytes_counter.write().await = Some(counter);
+    }
+
+    pub async fn set_estimate_counter(&self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        *self.estimate_counter.write().await = Some(counter);
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -299,6 +311,7 @@ impl StealthHttpClient {
         let mut redirects = Vec::new();
         let mut transfer_acc: u64 = 0;
         let counter = self.bytes_counter.read().await.clone();
+        let estimate = self.estimate_counter.read().await.clone();
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
@@ -435,6 +448,7 @@ impl StealthHttpClient {
                 &current_url,
                 request.max_response_bytes,
                 counter.as_deref(),
+                estimate.as_deref(),
             )
             .await?;
             drop(in_flight);
@@ -523,8 +537,15 @@ impl StealthHttpClient {
             .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
             .collect();
         let counter = self.bytes_counter.read().await.clone();
-        let resp_body =
-            read_wreq_body_limited(resp, url, 64 * 1024 * 1024, counter.as_deref()).await?;
+        let estimate = self.estimate_counter.read().await.clone();
+        let resp_body = read_wreq_body_limited(
+            resp,
+            url,
+            64 * 1024 * 1024,
+            counter.as_deref(),
+            estimate.as_deref(),
+        )
+        .await?;
         drop(in_flight);
 
         let transfer_bytes = crate::client::wire_bytes(&response_headers, resp_body.len());
@@ -639,6 +660,7 @@ mod tests {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             interceptor: tokio::sync::RwLock::new(None),
             bytes_counter: tokio::sync::RwLock::new(None),
+            estimate_counter: tokio::sync::RwLock::new(None),
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client
