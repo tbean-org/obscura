@@ -100,14 +100,18 @@ async fn read_wreq_body_limited(
     if content_length.is_some_and(|length| length > limit as u64) {
         return Err(response_too_large(url, limit));
     }
-    // On-wire size to reconcile to once the body completes: compressed body
-    // (Content-Length) + serialized response headers. None when unknown.
     let header_bytes: u64 = response
         .headers()
         .iter()
         .map(|(k, v)| k.as_str().len() as u64 + v.as_bytes().len() as u64 + 4)
         .sum();
-    let on_wire = content_length.map(|cl| cl + header_bytes);
+    let compressed = crate::client::is_compressed(
+        response
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+    );
+    let mut wire = crate::client::WireCounter::new(content_length, header_bytes, compressed);
 
     let capacity = response
         .content_length()
@@ -117,7 +121,6 @@ async fn read_wreq_body_limited(
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
     let mut body = Vec::with_capacity(capacity);
-    let mut charged: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             ObscuraNetError::Network(format!("Failed to read body: {}", error))
@@ -126,16 +129,12 @@ async fn read_wreq_body_limited(
             return Err(response_too_large(url, limit));
         }
         if let Some(c) = counter {
-            charged += crate::client::count_chunk(c, chunk.len(), content_length, charged);
+            wire.on_chunk(c, chunk.len());
         }
         body.extend_from_slice(&chunk);
     }
-    // Completed: top up to the exact on-wire total (compressed body + headers).
     if let Some(c) = counter {
-        let target = on_wire.unwrap_or(charged + header_bytes);
-        if target > charged {
-            c.fetch_add(target - charged, std::sync::atomic::Ordering::Relaxed);
-        }
+        wire.on_complete(c);
     }
     Ok(body)
 }
