@@ -93,13 +93,13 @@ pub struct Response {
 }
 
 // Accumulates on-wire bytes for one response into a shared counter as its body
-// is read. The HTTP client hands us DECODED chunks, so decoded bytes are used
+// is read. The HTTP client hands us DECODED chunks, so decoded bytes are counted
 // only for an uncompressed body (decoded == on-wire, exact even for a partial).
-// For a compressed body we never count decoded bytes; we charge Content-Length
-// (the compressed size) once — exact when the transfer completes, an upper bound
-// if it is cancelled/failed mid-body. Such upper-bound (and unmeasurable, i.e.
-// compressed with no Content-Length) cases increment the `estimate` counter while
-// pending and clear it only once confirmed exact, so the caller can mark the
+// A compressed body's decoded bytes are never counted: its Content-Length (the
+// compressed size) is charged once at start — exact once the transfer completes,
+// otherwise not exact (an upper bound if cut short, headers-only if there is no
+// Content-Length). Those not-exact cases increment the `estimate` counter while
+// pending and clear it only once confirmed exact, so the caller can flag the
 // total as an estimate. Response headers are charged once, at start.
 pub(crate) struct WireCounter {
     content_length: Option<u64>,
@@ -121,8 +121,9 @@ impl WireCounter {
     }
 
     /// Call once when the response is received, before reading the body. Charges
-    /// header bytes (so a fail-before-body still counts them) and, for a
-    /// compressed body, marks the total an estimate until completion confirms it.
+    /// header bytes (so a fail-before-body still counts them); for a compressed
+    /// body, charges Content-Length now and marks the total an estimate until
+    /// completion confirms it exact.
     pub(crate) fn on_start(
         &mut self,
         counter: &std::sync::atomic::AtomicU64,
@@ -130,6 +131,10 @@ impl WireCounter {
     ) {
         counter.fetch_add(self.header_bytes, std::sync::atomic::Ordering::Relaxed);
         if self.compressed {
+            if let Some(cl) = self.content_length {
+                counter.fetch_add(cl, std::sync::atomic::Ordering::Relaxed);
+                self.body_charged = cl;
+            }
             if let Some(e) = estimate {
                 e.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -137,22 +142,17 @@ impl WireCounter {
         }
     }
 
-    /// Call per decoded body chunk received.
+    /// Call per decoded body chunk received. Only uncompressed bodies count here;
+    /// a compressed body already charged Content-Length in on_start.
     pub(crate) fn on_chunk(&mut self, counter: &std::sync::atomic::AtomicU64, chunk_len: usize) {
         if self.compressed {
-            if self.body_charged == 0 {
-                if let Some(cl) = self.content_length {
-                    counter.fetch_add(cl, std::sync::atomic::Ordering::Relaxed);
-                    self.body_charged = cl;
-                }
-            }
-        } else {
-            let cap = self.content_length.unwrap_or(u64::MAX);
-            let add = (chunk_len as u64).min(cap.saturating_sub(self.body_charged));
-            if add > 0 {
-                counter.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
-                self.body_charged += add;
-            }
+            return;
+        }
+        let cap = self.content_length.unwrap_or(u64::MAX);
+        let add = (chunk_len as u64).min(cap.saturating_sub(self.body_charged));
+        if add > 0 {
+            counter.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
+            self.body_charged += add;
         }
     }
 
@@ -1845,6 +1845,69 @@ pub enum ObscuraNetError {
 
     #[error("Response body exceeded {limit} byte limit: {url}")]
     ResponseTooLarge { url: String, limit: usize },
+}
+
+#[cfg(test)]
+mod wire_counter_tests {
+    use super::WireCounter;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn run(cl: Option<u64>, headers: u64, compressed: bool, chunks: &[usize], complete: bool) -> (u64, u64) {
+        let bytes = AtomicU64::new(0);
+        let est = AtomicU64::new(0);
+        let mut wc = WireCounter::new(cl, headers, compressed);
+        wc.on_start(&bytes, Some(&est));
+        for &c in chunks {
+            wc.on_chunk(&bytes, c);
+        }
+        if complete {
+            wc.on_complete(&bytes, Some(&est));
+        }
+        (bytes.load(Ordering::Relaxed), est.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn uncompressed_complete_is_exact() {
+        // headers 20 + body 100 (decoded == on-wire), no estimate.
+        assert_eq!(run(Some(100), 20, false, &[60, 40], true), (120, 0));
+    }
+
+    #[test]
+    fn uncompressed_partial_counts_bytes_received() {
+        // A cancelled uncompressed transfer counts exactly what arrived; not an estimate.
+        assert_eq!(run(Some(100), 20, false, &[30], false), (50, 0));
+    }
+
+    #[test]
+    fn uncompressed_body_capped_at_content_length() {
+        // Decoded chunks exceeding Content-Length don't overcount the body.
+        assert_eq!(run(Some(50), 10, false, &[40, 40], true), (60, 0));
+    }
+
+    #[test]
+    fn compressed_complete_charges_content_length_and_clears_estimate() {
+        // Compressed: charge CL (40) + headers (20); decoded chunk sizes ignored;
+        // completion clears the estimate flag.
+        assert_eq!(run(Some(40), 20, true, &[100, 100], true), (60, 0));
+    }
+
+    #[test]
+    fn compressed_partial_is_upper_bound_and_flagged() {
+        // Cancelled compressed transfer: full CL charged, estimate stays set.
+        assert_eq!(run(Some(40), 20, true, &[100], false), (60, 1));
+    }
+
+    #[test]
+    fn compressed_no_content_length_counts_headers_only_and_flags() {
+        // No CL: body unmeasurable, headers only, flagged as not-exact even complete.
+        assert_eq!(run(None, 20, true, &[100], true), (20, 1));
+    }
+
+    #[test]
+    fn headers_charged_once() {
+        // header bytes are charged exactly once (in on_start), not per chunk.
+        assert_eq!(run(Some(30), 15, false, &[10, 10, 10], true), (45, 0));
+    }
 }
 
 #[cfg(test)]
