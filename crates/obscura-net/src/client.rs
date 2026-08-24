@@ -92,28 +92,81 @@ pub struct Response {
     pub transfer_bytes: u64,
 }
 
-/// Best-effort on-wire size of one response: body (Content-Length if given,
-/// else decoded length) plus the serialized response headers.
-// Charge a decoded body chunk to the on-wire byte counter, capped so a request's
-// running body contribution never exceeds its compressed Content-Length — decoded
-// bytes overstate on-wire for gzip/br, so this bounds a partial (cancelled/failed)
-// compressed transfer to its true on-wire size. Returns the amount charged.
-pub(crate) fn count_chunk(
-    counter: &std::sync::atomic::AtomicU64,
-    chunk_len: usize,
+// Accumulates on-wire bytes for one response into a shared counter as its body
+// is read. The counter must reflect bytes that crossed the proxy, but the HTTP
+// client hands us DECODED chunks, so decoded bytes are used only for an
+// uncompressed body (where decoded == on-wire). For a compressed body we never
+// count decoded bytes: we charge Content-Length (the compressed size) once, so a
+// completed transfer is exact and a partial/failed one overcounts at most to the
+// full compressed size. Response headers are counted once (they cross first).
+pub(crate) struct WireCounter {
     content_length: Option<u64>,
-    charged: u64,
-) -> u64 {
-    let add = match content_length {
-        Some(cl) => (chunk_len as u64).min(cl.saturating_sub(charged)),
-        None => chunk_len as u64,
-    };
-    if add > 0 {
-        counter.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
-    }
-    add
+    header_bytes: u64,
+    compressed: bool,
+    body_charged: u64,
+    headers_charged: bool,
 }
 
+impl WireCounter {
+    pub(crate) fn new(content_length: Option<u64>, header_bytes: u64, compressed: bool) -> Self {
+        Self {
+            content_length,
+            header_bytes,
+            compressed,
+            body_charged: 0,
+            headers_charged: false,
+        }
+    }
+
+    fn charge_headers(&mut self, counter: &std::sync::atomic::AtomicU64) {
+        if !self.headers_charged {
+            counter.fetch_add(self.header_bytes, std::sync::atomic::Ordering::Relaxed);
+            self.headers_charged = true;
+        }
+    }
+
+    /// Call per decoded body chunk received.
+    pub(crate) fn on_chunk(&mut self, counter: &std::sync::atomic::AtomicU64, chunk_len: usize) {
+        self.charge_headers(counter);
+        if self.compressed {
+            // Never count decoded bytes for a compressed body; charge the
+            // compressed Content-Length once. No Content-Length -> body unknown,
+            // count nothing (don't fabricate from decoded length).
+            if self.body_charged == 0 {
+                if let Some(cl) = self.content_length {
+                    counter.fetch_add(cl, std::sync::atomic::Ordering::Relaxed);
+                    self.body_charged = cl;
+                }
+            }
+        } else {
+            let cap = self.content_length.unwrap_or(u64::MAX);
+            let add = (chunk_len as u64).min(cap.saturating_sub(self.body_charged));
+            if add > 0 {
+                counter.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
+                self.body_charged += add;
+            }
+        }
+    }
+
+    /// Call once after the body fully completes.
+    pub(crate) fn on_complete(&mut self, counter: &std::sync::atomic::AtomicU64) {
+        self.charge_headers(counter);
+        // Uncompressed with a Content-Length larger than the decoded bytes seen
+        // (unusual) tops up to it; compressed already charged Content-Length.
+        if !self.compressed {
+            if let Some(cl) = self.content_length {
+                if cl > self.body_charged {
+                    counter
+                        .fetch_add(cl - self.body_charged, std::sync::atomic::Ordering::Relaxed);
+                    self.body_charged = cl;
+                }
+            }
+        }
+    }
+}
+
+/// Best-effort on-wire size of one response: body (Content-Length if given,
+/// else decoded length) plus the serialized response headers.
 pub fn wire_bytes(headers: &HashMap<String, String>, body_len: usize) -> u64 {
     let body = headers
         .get("content-length")
@@ -864,14 +917,19 @@ async fn read_reqwest_body_limited(
         .iter()
         .map(|(k, v)| k.as_str().len() as u64 + v.as_bytes().len() as u64 + 4)
         .sum();
-    let on_wire = content_length.map(|cl| cl + header_bytes);
+    let compressed = is_compressed(
+        response
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+    );
+    let mut wire = WireCounter::new(content_length, header_bytes, compressed);
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(0)
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
-    let mut charged: u64 = 0;
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         ObscuraNetError::Network(format!("Failed to read body: {}", error))
     })? {
@@ -879,18 +937,21 @@ async fn read_reqwest_body_limited(
             return Err(response_too_large(url, limit));
         }
         if let Some(c) = counter {
-            charged += count_chunk(c, chunk.len(), content_length, charged);
+            wire.on_chunk(c, chunk.len());
         }
         body.extend_from_slice(&chunk);
     }
-    // Completed: top up to the exact on-wire total (compressed body + headers).
     if let Some(c) = counter {
-        let target = on_wire.unwrap_or(charged + header_bytes);
-        if target > charged {
-            c.fetch_add(target - charged, std::sync::atomic::Ordering::Relaxed);
-        }
+        wire.on_complete(c);
     }
     Ok(body)
+}
+
+// A response is compressed when Content-Encoding is present and not `identity`.
+pub(crate) fn is_compressed(content_encoding: Option<&str>) -> bool {
+    content_encoding
+        .map(|v| !v.trim().is_empty() && !v.eq_ignore_ascii_case("identity"))
+        .unwrap_or(false)
 }
 
 pub struct ObscuraHttpClient {
