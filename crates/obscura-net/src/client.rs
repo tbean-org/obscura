@@ -2819,3 +2819,199 @@ mod cert_env_tests {
         ));
     }
 }
+
+// Integration tests for on-wire byte accounting over a live socket, the
+// reqwest-transport mirror of wreq_client::tests::wire_accounting. The reqwest
+// path runs on a STOCK reqwest: transparent decompression strips
+// Content-Encoding/Content-Length, so compressed responses are measured
+// decoded (an unflagged overcount vs on-wire). The gzip tests pin that actual
+// behavior as documentation; only the wreq/stealth transport measures true
+// on-wire bytes (see wreq_client.rs).
+#[cfg(test)]
+mod wire_accounting {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use url::Url;
+
+    use crate::client::{ObscuraHttpClient, ResourceRequest, ResourceType};
+    use crate::cookies::CookieJar;
+
+    const PLAIN_BODY: &str =
+        "<!DOCTYPE html><html><body><p id=\"mark\">gzip ok</p></body></html>";
+    const GZIP_BODY: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0xb3, 0x51, 0x74, 0xf1,
+        0x77, 0x0e, 0x89, 0x0c, 0x70, 0x55, 0xc8, 0x28, 0xc9, 0xcd, 0xb1, 0xb3, 0x81, 0x90,
+        0x49, 0xf9, 0x29, 0x95, 0x76, 0x36, 0x05, 0x0a, 0x99, 0x29, 0xb6, 0x4a, 0xb9, 0x89,
+        0x45, 0xd9, 0x4a, 0x76, 0xe9, 0x55, 0x99, 0x05, 0x0a, 0xf9, 0xd9, 0x36, 0xfa, 0x05,
+        0x76, 0x36, 0xfa, 0x10, 0x69, 0x7d, 0xb0, 0x5a, 0x00, 0x80, 0x3d, 0x1c, 0x5f, 0x41,
+        0x00, 0x00, 0x00,
+    ];
+
+    async fn raw_fixture(responses: Vec<Vec<u8>>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 2048];
+                loop {
+                    let Ok(read) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(&response).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        port
+    }
+
+    fn header_sum(head: &str) -> u64 {
+        head.lines()
+            .filter(|line| line.contains(':'))
+            .map(|line| {
+                let (name, value) = line.split_once(':').unwrap();
+                name.len() as u64 + value.trim().len() as u64 + 4
+            })
+            .sum()
+    }
+
+    async fn client_with_counters() -> (ObscuraHttpClient, Arc<AtomicU64>, Arc<AtomicU64>) {
+        let client =
+            ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let bytes = Arc::new(AtomicU64::new(0));
+        let estimate = Arc::new(AtomicU64::new(0));
+        client.set_bytes_counter(Arc::clone(&bytes)).await;
+        client.set_estimate_counter(Arc::clone(&estimate)).await;
+        (client, bytes, estimate)
+    }
+
+    fn gzip_head() -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            GZIP_BODY.len()
+        )
+    }
+
+    // ACTUAL behavior, pinned as documentation: stock reqwest strips
+    // Content-Encoding/Content-Length before the transport sees them, so a
+    // compressed response is charged its DECODED length — an overcount vs
+    // on-wire, and not flagged as an estimate.
+    #[tokio::test]
+    async fn reqwest_gzip_complete_charges_decoded_length_unflagged() {
+        let head = gzip_head();
+        let mut raw = head.clone().into_bytes();
+        raw.extend_from_slice(GZIP_BODY);
+        let port = raw_fixture(vec![raw]).await;
+        let (client, bytes, estimate) = client_with_counters().await;
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+        let resp = client.fetch_resource_with_callbacks(
+            &url,
+            ResourceRequest::navigation(),
+            None,
+        ).await.unwrap();
+        assert_eq!(resp.text(), PLAIN_BODY);
+        let visible_headers = header_sum(&head)
+            - ("content-encoding".len() as u64 + "gzip".len() as u64 + 4)
+            - ("content-length".len() as u64 + GZIP_BODY.len().to_string().len() as u64 + 4);
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            visible_headers + PLAIN_BODY.len() as u64,
+            "decoded length charged, not the compressed on-wire length"
+        );
+        assert_eq!(estimate.load(Ordering::Relaxed), 0);
+    }
+
+    // Cut short, the charged partial is the decoded prefix, never the
+    // compressed Content-Length, and still nothing flags it.
+    #[tokio::test]
+    async fn reqwest_gzip_cut_short_never_charges_content_length() {
+        let head = gzip_head();
+        let mut raw = head.clone().into_bytes();
+        raw.extend_from_slice(&GZIP_BODY[..GZIP_BODY.len() / 2]);
+        let port = raw_fixture(vec![raw]).await;
+        let (client, bytes, estimate) = client_with_counters().await;
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+        let result = client
+            .fetch_resource_with_callbacks(&url, ResourceRequest::navigation(), None)
+            .await;
+        assert!(result.is_err(), "truncated body must fail the fetch");
+        let visible_headers = header_sum(&head)
+            - ("content-encoding".len() as u64 + "gzip".len() as u64 + 4)
+            - ("content-length".len() as u64 + GZIP_BODY.len().to_string().len() as u64 + 4);
+        let charged = bytes.load(Ordering::Relaxed);
+        assert!(
+            charged < visible_headers + GZIP_BODY.len() as u64,
+            "compressed Content-Length must NOT be charged"
+        );
+        assert_eq!(estimate.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reqwest_uncompressed_complete_counts_exact_on_wire_bytes() {
+        let body = "var x = 1;".repeat(50);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/javascript\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let raw = format!("{head}{body}").into_bytes();
+        let port = raw_fixture(vec![raw]).await;
+        let (client, bytes, estimate) = client_with_counters().await;
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/app.js")).unwrap();
+
+        let resp = client
+            .fetch_resource_with_callbacks(&url, ResourceRequest::navigation(), None)
+            .await
+            .unwrap();
+        assert_eq!(resp.body.len(), body.len());
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            header_sum(&head) + body.len() as u64
+        );
+        assert_eq!(estimate.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reqwest_font_subresource_also_counts() {
+        let body = b"font-bytes".repeat(10);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\naccess-control-allow-origin: *\r\ncontent-type: font/woff2\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut raw = head.clone().into_bytes();
+        raw.extend_from_slice(&body);
+        let port = raw_fixture(vec![raw]).await;
+        let (client, bytes, estimate) = client_with_counters().await;
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/font.woff2")).unwrap();
+        let initiator = Url::parse("http://127.0.0.1:1/page").unwrap();
+
+        let resp = client
+            .fetch_resource_with_callbacks(
+                &url,
+                ResourceRequest::subresource(ResourceType::Font, &initiator),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.body.len(), body.len());
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            header_sum(&head) + body.len() as u64
+        );
+        assert_eq!(estimate.load(Ordering::Relaxed), 0);
+    }
+}

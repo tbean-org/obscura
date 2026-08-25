@@ -57,6 +57,10 @@ anyhow = "1"
 base64 = "0.22"
 
 [patch.crates-io]
+# bean fork of wreq: wire-bytes patch (pre-decompression byte accounting via
+# response extensions) on top of the pinned rc.29 tag. bean's bazel build
+# applies the same diff as bazel/patches/wreq_wire_bytes.patch.
+wreq = { git = "https://github.com/tbean-org/wreq", rev = "9685b1c4c0d5e1cd96d50bc49934a9b530383449" }
 # Keep the grid shrink-to-fit correction local until it lands upstream.
 taffy = { path = "vendor/taffy" }
 # Carry the same canonical variable-font coordinates through shaping and

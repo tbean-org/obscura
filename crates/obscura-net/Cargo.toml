@@ -26,6 +26,9 @@ futures-util = { version = "0.3", optional = true }
 # Emulation builder reshuffled). A caret requirement let a fresh resolve pull a
 # newer, incompatible rc and broke `cargo build --features stealth` (issue #234).
 # Pin exact versions so the build always resolves to the API wreq_client.rs targets.
+# wreq is overridden to the bean fork ([patch.crates-io] in the workspace root):
+# it carries the wire-bytes patch — response extensions exposing
+# pre-decompression bytes, see wreq_client.rs accounting — on top of this tag.
 wreq-util = { version = "=3.0.0-rc.12", optional = true }
 
 [dev-dependencies]

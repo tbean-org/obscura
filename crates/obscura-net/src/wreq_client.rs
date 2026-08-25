@@ -85,6 +85,8 @@ fn validate_wreq_cors_response(
     )
 }
 
+// Returns the decoded body plus this hop's on-wire byte count (headers +
+// body as transferred, before any decompression).
 #[cfg(feature = "stealth")]
 async fn read_wreq_body_limited(
     response: wreq::Response,
@@ -92,28 +94,53 @@ async fn read_wreq_body_limited(
     limit: usize,
     counter: Option<&std::sync::atomic::AtomicU64>,
     estimate: Option<&std::sync::atomic::AtomicU64>,
-) -> Result<Vec<u8>, ObscuraNetError> {
-    let content_length = response
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    if content_length.is_some_and(|length| length > limit as u64) {
-        return Err(response_too_large(url, limit));
-    }
-    let header_bytes: u64 = response
+) -> Result<(Vec<u8>, u64), ObscuraNetError> {
+    // Pre-decode wire facts stashed by the wreq fork below its decompression
+    // layer; absent on a stock wreq, which strips both headers before the
+    // transport can observe them (the decoded-charging gap).
+    let wire_received = response
+        .extensions()
+        .get::<wreq::WireBytesReceived>()
+        .map(|w| std::sync::Arc::clone(&w.0));
+    let original_encoding = response
+        .extensions()
+        .get::<wreq::OriginalContentEncoding>()
+        .and_then(|v| v.0.to_str().ok().map(str::to_owned));
+    let original_content_length = response
+        .extensions()
+        .get::<wreq::OriginalContentLength>()
+        .and_then(|v| v.0.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok()));
+
+    let mut header_bytes: u64 = response
         .headers()
         .iter()
         .map(|(k, v)| k.as_str().len() as u64 + v.as_bytes().len() as u64 + 4)
         .sum();
+    // The stripped headers crossed the wire too; charge them back.
+    if let Some(enc) = &original_encoding {
+        header_bytes += "content-encoding".len() as u64 + enc.len() as u64 + 4;
+        if let Some(cl) = original_content_length {
+            header_bytes += "content-length".len() as u64 + cl.to_string().len() as u64 + 4;
+        }
+    }
+
+    let content_length = original_content_length.or_else(|| {
+        response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    });
+    if content_length.is_some_and(|length| length > limit as u64) {
+        return Err(response_too_large(url, limit));
+    }
+
     let compressed = crate::client::is_compressed(
         response
             .headers()
             .get("content-encoding")
             .and_then(|v| v.to_str().ok()),
     );
-    let mut wire = crate::client::WireCounter::new(content_length, header_bytes, compressed);
-
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
@@ -122,6 +149,37 @@ async fn read_wreq_body_limited(
     let stream = response.bytes_stream();
     futures_util::pin_mut!(stream);
     let mut body = Vec::with_capacity(capacity);
+
+    if let Some(received) = wire_received {
+        // Exact: the fork counts pre-decode bytes live below the decoder, so
+        // every body — compressed, chunked, or cut short — is measured, not
+        // estimated, and the estimate flag stays clear on this path.
+        if let Some(c) = counter {
+            c.fetch_add(header_bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut charged = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let now = received.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(c) = counter {
+                c.fetch_add(now - charged, std::sync::atomic::Ordering::Relaxed);
+            }
+            charged = now;
+            let chunk = chunk.map_err(|error| {
+                ObscuraNetError::Network(format!("Failed to read body: {}", error))
+            })?;
+            if chunk.len() > limit.saturating_sub(body.len()) {
+                return Err(response_too_large(url, limit));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let total = received.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(c) = counter {
+            c.fetch_add(total - charged, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok((body, header_bytes + total));
+    }
+
+    let mut wire = crate::client::WireCounter::new(content_length, header_bytes, compressed);
     if let Some(c) = counter {
         wire.on_start(c, estimate);
     }
@@ -140,7 +198,8 @@ async fn read_wreq_body_limited(
     if let Some(c) = counter {
         wire.on_complete(c, estimate);
     }
-    Ok(body)
+    let body_wire = content_length.unwrap_or(body.len() as u64);
+    Ok((body, header_bytes + body_wire))
 }
 
 #[cfg(feature = "stealth")]
@@ -443,7 +502,7 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = read_wreq_body_limited(
+            let (body, hop_wire) = read_wreq_body_limited(
                 resp,
                 &current_url,
                 request.max_response_bytes,
@@ -453,7 +512,7 @@ impl StealthHttpClient {
             .await?;
             drop(in_flight);
 
-            let transfer_bytes = transfer_acc + crate::client::wire_bytes(&response_headers, body.len());
+            let transfer_bytes = transfer_acc + hop_wire;
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
@@ -538,7 +597,7 @@ impl StealthHttpClient {
             .collect();
         let counter = self.bytes_counter.read().await.clone();
         let estimate = self.estimate_counter.read().await.clone();
-        let resp_body = read_wreq_body_limited(
+        let (resp_body, transfer_bytes) = read_wreq_body_limited(
             resp,
             url,
             64 * 1024 * 1024,
@@ -548,7 +607,6 @@ impl StealthHttpClient {
         .await?;
         drop(in_flight);
 
-        let transfer_bytes = crate::client::wire_bytes(&response_headers, resp_body.len());
         Ok(Response {
             url: url.clone(),
             status: status.as_u16(),
@@ -714,5 +772,300 @@ mod tests {
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), PLAIN_BODY, "gzip body must be decompressed");
+    }
+
+    mod wire_accounting {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use url::Url;
+
+        use super::{GZIP_BODY, PLAIN_BODY, StealthHttpClient};
+        use crate::client::{RequestInfo, ResourceRequest, ResourceType, Response};
+        use crate::cookies::CookieJar;
+        use crate::interceptor::{InterceptAction, RequestInterceptor};
+
+        // Serves one raw response per connection and counts connections, so
+        // tests can assert whether the origin was contacted at all.
+        async fn raw_fixture(responses: Vec<Vec<u8>>) -> (u16, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_task = Arc::clone(&hits);
+            tokio::spawn(async move {
+                for response in responses {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    hits_task.fetch_add(1, Ordering::Relaxed);
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            (port, hits)
+        }
+
+        fn head(status_line: &str, headers: &str) -> String {
+            format!("{status_line}\r\n{headers}connection: close\r\n\r\n")
+        }
+
+        // Mirrors the transport's approximation: sum of name+value+4 per header.
+        fn header_sum(head: &str) -> u64 {
+            head.lines()
+                .filter(|line| line.contains(':'))
+                .map(|line| {
+                    let (name, value) = line.split_once(':').unwrap();
+                    name.len() as u64 + value.trim().len() as u64 + 4
+                })
+                .sum()
+        }
+
+        async fn client_with_counters(
+        ) -> (StealthHttpClient, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+            let bytes = Arc::new(AtomicU64::new(0));
+            let estimate = Arc::new(AtomicU64::new(0));
+            client.set_bytes_counter(Arc::clone(&bytes)).await;
+            client.set_estimate_counter(Arc::clone(&estimate)).await;
+            (client, bytes, estimate)
+        }
+
+        fn url(port: u16, path: &str) -> Url {
+            Url::parse(&format!("http://127.0.0.1:{port}{path}")).unwrap()
+        }
+
+        #[tokio::test]
+        async fn uncompressed_complete_counts_exact_on_wire_bytes() {
+            let body = "var x = 1;".repeat(50);
+            let head = head(
+                "HTTP/1.1 200 OK",
+                &format!(
+                    "content-type: application/javascript\r\ncontent-length: {}\r\n",
+                    body.len()
+                ),
+            );
+            let raw = format!("{head}{body}").into_bytes();
+            let (port, _) = raw_fixture(vec![raw]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+
+            let resp = client.fetch(&url(port, "/app.js")).await.unwrap();
+            assert_eq!(resp.body.len(), body.len());
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + body.len() as u64
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
+        async fn gzip_complete_charges_compressed_length_not_decoded() {
+            let head = head(
+                "HTTP/1.1 200 OK",
+                &format!(
+                    "content-type: text/html\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n",
+                    GZIP_BODY.len()
+                ),
+            );
+            let mut raw = head.clone().into_bytes();
+            raw.extend_from_slice(GZIP_BODY);
+            let (port, _) = raw_fixture(vec![raw]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+
+            let resp = client.fetch(&url(port, "/")).await.unwrap();
+            assert_eq!(resp.text(), PLAIN_BODY, "body is decoded for the parser");
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + GZIP_BODY.len() as u64,
+                "compressed on-wire length charged, not the decoded length"
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        }
+
+        // Cut short below the decoder: the partial that crossed is counted
+        // exactly, so no estimate flag either.
+        #[tokio::test]
+        async fn gzip_cut_short_counts_exact_partial_without_estimate() {
+            let half = GZIP_BODY.len() / 2;
+            let head = head(
+                "HTTP/1.1 200 OK",
+                &format!(
+                    "content-type: text/html\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n",
+                    GZIP_BODY.len()
+                ),
+            );
+            let mut raw = head.clone().into_bytes();
+            raw.extend_from_slice(&GZIP_BODY[..half]);
+            let (port, _) = raw_fixture(vec![raw]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+
+            let result = client.fetch(&url(port, "/")).await;
+            assert!(result.is_err(), "truncated body must fail the fetch");
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + half as u64,
+                "exact partial pre-decode count"
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        }
+
+        // Chunked compressed bodies have no Content-Length to lean on; the
+        // pre-decode counter still measures them exactly.
+        #[tokio::test]
+        async fn gzip_chunked_without_content_length_counts_exact_wire_bytes() {
+            let head = head(
+                "HTTP/1.1 200 OK",
+                "content-type: text/html\r\ncontent-encoding: gzip\r\ntransfer-encoding: chunked\r\n",
+            );
+            let mut raw = head.clone().into_bytes();
+            for piece in [&GZIP_BODY[..20], &GZIP_BODY[20..]] {
+                raw.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+                raw.extend_from_slice(piece);
+                raw.extend_from_slice(b"\r\n");
+            }
+            raw.extend_from_slice(b"0\r\n\r\n");
+            let (port, _) = raw_fixture(vec![raw]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+
+            let resp = client.fetch(&url(port, "/")).await.unwrap();
+            assert_eq!(resp.text(), PLAIN_BODY);
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + GZIP_BODY.len() as u64,
+                "exact compressed length even without Content-Length"
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
+        async fn uncompressed_cut_short_counts_exact_partial() {
+            let body = "x".repeat(1000);
+            let head = head(
+                "HTTP/1.1 200 OK",
+                "content-type: text/plain\r\ncontent-length: 1000\r\n",
+            );
+            let mut raw = head.clone().into_bytes();
+            raw.extend_from_slice(&body.as_bytes()[..400]);
+            let (port, _) = raw_fixture(vec![raw]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+
+            let result = client.fetch(&url(port, "/")).await;
+            assert!(result.is_err(), "truncated body must fail the fetch");
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + 400,
+                "decoded == on-wire for uncompressed, so the partial is exact"
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
+        async fn redirect_chain_charges_each_hop_once() {
+            let redirect = head(
+                "HTTP/1.1 302 Found",
+                "location: /final.js\r\ncontent-length: 0\r\n",
+            );
+            let body = "var final = 1;";
+            let final_head = head(
+                "HTTP/1.1 200 OK",
+                &format!(
+                    "content-type: application/javascript\r\ncontent-length: {}\r\n",
+                    body.len()
+                ),
+            );
+            let raw_final = format!("{final_head}{body}").into_bytes();
+            let (port, _) = raw_fixture(vec![redirect.clone().into_bytes(), raw_final]).await;
+            let (client, bytes, estimate) = client_with_counters().await;
+
+            let resp = client.fetch(&url(port, "/app.js")).await.unwrap();
+            assert_eq!(resp.body, body.as_bytes());
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&redirect) + header_sum(&final_head) + body.len() as u64,
+                "redirect hop headers + final hop headers and body"
+            );
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+        }
+
+        struct FulfillAll;
+
+        #[async_trait::async_trait]
+        impl RequestInterceptor for FulfillAll {
+            async fn intercept(&self, request: &RequestInfo) -> InterceptAction {
+                InterceptAction::Fulfill(Response {
+                    url: request.url.clone(),
+                    status: 200,
+                    headers: HashMap::new(),
+                    body: b"cached-body".to_vec(),
+                    redirected_from: vec![],
+                    transfer_bytes: 0,
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn fulfilled_from_cache_counts_zero_network_bytes() {
+            let (port, hits) = raw_fixture(vec![
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec(),
+            ])
+            .await;
+            let (client, bytes, estimate) = client_with_counters().await;
+            client.set_interceptor(Arc::new(FulfillAll)).await;
+
+            let resp = client.fetch(&url(port, "/app.js")).await.unwrap();
+            assert_eq!(resp.body, b"cached-body");
+            assert_eq!(bytes.load(Ordering::Relaxed), 0);
+            assert_eq!(estimate.load(Ordering::Relaxed), 0);
+            assert_eq!(hits.load(Ordering::Relaxed), 0, "origin must not be hit");
+        }
+
+        #[tokio::test]
+        async fn cors_required_request_bypasses_url_keyed_cache() {
+            let body = b"font-from-origin";
+            let head = head(
+                "HTTP/1.1 200 OK",
+                &format!(
+                    "access-control-allow-origin: *\r\ncontent-type: font/woff2\r\ncontent-length: {}\r\n",
+                    body.len()
+                ),
+            );
+            let mut raw = head.clone().into_bytes();
+            raw.extend_from_slice(body);
+            let (port, hits) = raw_fixture(vec![raw]).await;
+            let (client, bytes, _) = client_with_counters().await;
+            client.set_interceptor(Arc::new(FulfillAll)).await;
+
+            let initiator = Url::parse("http://127.0.0.1:1/page").unwrap();
+            let target = url(port, "/font.woff2");
+            let resp = client
+                .fetch_resource_with_callbacks(
+                    &target,
+                    ResourceRequest::subresource(ResourceType::Font, &initiator),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.body, body, "origin response, not the cache entry");
+            assert_eq!(hits.load(Ordering::Relaxed), 1, "CORS request hit the network");
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                header_sum(&head) + body.len() as u64
+            );
+        }
     }
 }
