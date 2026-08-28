@@ -714,7 +714,11 @@ fn split_css_imports(css: &str) -> (Vec<StylesheetImport>, String) {
 /// statement body (the text between `@import` and `;`).
 fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
     let s = stmt.trim();
-    let is_url_fn = s.len() >= 4 && s[..4].eq_ignore_ascii_case("url(");
+    // `get` instead of indexing: a multi-byte lead character makes byte index
+    // 4 a non-boundary, and "url(" is ASCII so the prefix cannot match there.
+    let is_url_fn = s
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("url("));
     let (url, media) = if is_url_fn {
         let rest = &s[4..];
         let end = rest.find(')')?;
@@ -6218,6 +6222,20 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn parse_import_url_tolerates_multibyte_lead_characters() {
+        // Byte index 4 splits the second € (3-byte chars), so the old `s[..4]`
+        // prefix check panicked on this page-controlled stylesheet text.
+        assert_eq!(parse_import_url("€€x"), None);
+        assert_eq!(
+            parse_import_url("'€.css'"),
+            Some(StylesheetImport {
+                url: "€.css".to_string(),
+                media: None,
+            })
+        );
     }
 
     #[test]

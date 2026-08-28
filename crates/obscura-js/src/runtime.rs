@@ -1950,12 +1950,15 @@ impl ObscuraJsRuntime {
 
         self.begin_javascript_task();
         let budget = tokio::time::Duration::from_millis(budget_ms);
-        // deno_core 0.350 asserts instead of treating a second evaluation as
-        // the module-map no-op required by browsers. The local outcome cache
-        // covers duplicate roots prepared by Obscura. A root can also have
-        // been evaluated earlier as another graph's dependency, which is only
-        // observable when mod_evaluate checks V8's private module status, so
-        // contain that dependency assertion at this boundary as well.
+        // Browser module evaluation is idempotent. Registry deno_core 0.350
+        // asserted `status == Instantiated` here instead of the no-op browsers
+        // require; the tbean-org/deno_core fork backports the 0.364
+        // early-return, so a second evaluation is now a real no-op even
+        // in panic=abort builds where catch_unwind cannot run. Keep the catch
+        // as defense: the local outcome cache covers duplicate roots prepared
+        // by Obscura, and a root can also have been evaluated earlier as
+        // another graph's dependency, which is only observable when
+        // mod_evaluate checks V8's private module status.
         let evaluation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.mod_evaluate(module_id)
         }));
@@ -15004,6 +15007,40 @@ mod tests {
             rt.evaluate("globalThis.__module_entry_ran === true").unwrap(),
             serde_json::json!(true),
         );
+        assert_eq!(
+            rt.evaluate("globalThis.__shared_module_runs").unwrap(),
+            serde_json::json!(1.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mod_evaluate_on_evaluated_module_is_a_noop() {
+        let base = spawn_duplicate_module_graph_server();
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar, None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        rt.set_http_client(client);
+
+        let shared = rt
+            .prepare_module(&format!("{}/shared.js", base), 1_000)
+            .await
+            .unwrap();
+        let module_id = shared.module_id;
+        rt.evaluate_prepared_module(shared, 1_000).await.unwrap();
+
+        // deno_core 0.350 asserted `status == Instantiated` at the top of
+        // mod_evaluate ("Module already evaluated"), which aborts the
+        // panic=abort worker image when a page re-reaches an evaluated module
+        // through a path Obscura's outcome caches do not cover (dependency of
+        // a failed graph, dynamic import). deno_core 0.364 returns early
+        // instead; the vendored backport must too, so a duplicate evaluation
+        // degrades to a no-op rather than a crash.
+        rt.runtime
+            .mod_evaluate(module_id)
+            .await
+            .expect("evaluating an already-evaluated module must be a no-op");
         assert_eq!(
             rt.evaluate("globalThis.__shared_module_runs").unwrap(),
             serde_json::json!(1.0),
