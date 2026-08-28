@@ -17,12 +17,15 @@ stealth = ["obscura-net/stealth"]
 render = ["dep:obscura-render", "obscura-render/paint"]
 
 [build-dependencies]
-deno_core = "0.350"
+# tbean-org/deno_core fork: 0.350.0 plus the upstream early-return for
+# already-evaluated modules (denoland/deno_core#1221, shipped in 0.364.0).
+# Pinned by rev so the fix travels with this repo as a git dependency.
+deno_core = { git = "https://github.com/tbean-org/deno_core", rev = "ff72525176f15798bf102fc2888b607e1f9ad1f8" }
 
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
-deno_core = "0.350"
+deno_core = { git = "https://github.com/tbean-org/deno_core", rev = "ff72525176f15798bf102fc2888b607e1f9ad1f8" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
