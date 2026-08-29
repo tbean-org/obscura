@@ -15047,6 +15047,57 @@ mod tests {
         );
     }
 
+    fn spawn_throwing_module_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                let body = "throw new Error('boom');";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/javascript\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{}", address)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mod_evaluate_on_errored_module_rethrows_cached_error() {
+        let base = spawn_throwing_module_server();
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar, None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        rt.set_http_client(client);
+
+        let shared = rt
+            .prepare_module(&format!("{}/throwing.js", base), 1_000)
+            .await
+            .unwrap();
+        let module_id = shared.module_id;
+        // The first evaluation fails, leaving the module in Errored state.
+        assert!(rt.evaluate_prepared_module(shared, 1_000).await.is_err());
+
+        // Registry deno_core 0.350 asserts `status == Instantiated` at the top
+        // of mod_evaluate when a page re-reaches an errored module ("Module
+        // not instantiated", left: Errored), aborting the panic=abort worker
+        // image. The fork re-throws the cached exception instead: the import
+        // fails gracefully and the process survives.
+        let result = rt.runtime.mod_evaluate(module_id).await;
+        assert!(result.is_err(), "errored module must re-throw, not panic");
+    }
+
     #[test]
     fn heap_limit_terminates_script_and_runtime_recovers() {
         crate::v8_flags::set_v8_flags("--max-old-space-size=32 --max-semi-space-size=1");
