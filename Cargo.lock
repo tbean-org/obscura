@@ -688,7 +688,7 @@ dependencies = [
 [[package]]
 name = "deno_core"
 version = "0.350.0"
-source = "git+https://github.com/tbean-org/deno_core?rev=111c5b7beed44f6c5ee8d08038f770f6178bd9fb#111c5b7beed44f6c5ee8d08038f770f6178bd9fb"
+source = "git+https://github.com/tbean-org/deno_core?rev=7dce43965bf2fe11bcf2a3499c894a76169eb647#7dce43965bf2fe11bcf2a3499c894a76169eb647"
 dependencies = [
  "anyhow",
  "az",
@@ -756,7 +756,7 @@ dependencies = [
 [[package]]
 name = "deno_ops"
 version = "0.226.0"
-source = "git+https://github.com/tbean-org/deno_core?rev=111c5b7beed44f6c5ee8d08038f770f6178bd9fb#111c5b7beed44f6c5ee8d08038f770f6178bd9fb"
+source = "git+https://github.com/tbean-org/deno_core?rev=7dce43965bf2fe11bcf2a3499c894a76169eb647#7dce43965bf2fe11bcf2a3499c894a76169eb647"
 dependencies = [
  "indexmap",
  "proc-macro-rules",
@@ -2871,7 +2871,7 @@ dependencies = [
 [[package]]
 name = "serde_v8"
 version = "0.259.0"
-source = "git+https://github.com/tbean-org/deno_core?rev=111c5b7beed44f6c5ee8d08038f770f6178bd9fb#111c5b7beed44f6c5ee8d08038f770f6178bd9fb"
+source = "git+https://github.com/tbean-org/deno_core?rev=7dce43965bf2fe11bcf2a3499c894a76169eb647#7dce43965bf2fe11bcf2a3499c894a76169eb647"
 dependencies = [
  "deno_error",
  "num-bigint",
