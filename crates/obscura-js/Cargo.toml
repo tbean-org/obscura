@@ -18,14 +18,15 @@ render = ["dep:obscura-render", "obscura-render/paint"]
 
 [build-dependencies]
 # tbean-org/deno_core fork: 0.350.0 plus the upstream early-return for
-# already-evaluated modules (denoland/deno_core#1221, shipped in 0.364.0).
+# already-evaluated modules (denoland/deno_core#1221, shipped in 0.364.0),
+# an errored-module rethrow, and a teardown guard in promise_reject_callback.
 # Pinned by rev so the fix travels with this repo as a git dependency.
-deno_core = { git = "https://github.com/tbean-org/deno_core", rev = "111c5b7beed44f6c5ee8d08038f770f6178bd9fb" }
+deno_core = { git = "https://github.com/tbean-org/deno_core", rev = "7dce43965bf2fe11bcf2a3499c894a76169eb647" }
 
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
-deno_core = { git = "https://github.com/tbean-org/deno_core", rev = "111c5b7beed44f6c5ee8d08038f770f6178bd9fb" }
+deno_core = { git = "https://github.com/tbean-org/deno_core", rev = "7dce43965bf2fe11bcf2a3499c894a76169eb647" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
