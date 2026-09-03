@@ -11,6 +11,7 @@ use selectors::matching::{
 use selectors::parser::{self, ParseRelative, SelectorParseErrorKind};
 use selectors::visitor::SelectorVisitor;
 use selectors::{Element, OpaqueElement, SelectorList};
+use std::collections::HashMap;
 
 use crate::tree::{DomTree, NodeData, NodeId};
 
@@ -695,6 +696,51 @@ impl DomTree {
         self.query_selector_all_from(self.document(), selector)
     }
 
+    /// Element ids carrying attribute `name`, from the generation-gated
+    /// attribute index. Rebuilds the index once per mutation generation, so a
+    /// static page (the querySelectorAll polling case) pays one scan total and
+    /// a mutating page never reads a stale index.
+    fn indexed_candidates(&self, key: &SelectorKey) -> Option<Vec<crate::tree::NodeId>> {
+        let gen = self.inner.borrow().mutation_gen.get();
+        let fresh = matches!(
+            &*self.inner.borrow().attr_index.borrow(),
+            Some(cache) if cache.gen == gen
+        );
+        if !fresh {
+            self.rebuild_attr_index(gen);
+        }
+        let tree = self.inner.borrow();
+        let index = tree.attr_index.borrow();
+        let cache = index.as_ref()?;
+        match key {
+            SelectorKey::Attribute(name) => Some(cache.map.get(name).cloned().unwrap_or_default()),
+            SelectorKey::Local(tag) => Some(cache.tag_map.get(tag).cloned().unwrap_or_default()),
+            _ => None,
+        }
+    }
+
+    fn rebuild_attr_index(&self, gen: u64) {
+        let mut map: HashMap<String, Vec<crate::tree::NodeId>> = HashMap::new();
+        let mut tag_map: HashMap<String, Vec<crate::tree::NodeId>> = HashMap::new();
+        for (idx, slot) in self.inner.borrow().nodes.iter().enumerate() {
+            let Some(node) = slot.as_ref() else { continue };
+            let Some(name) = node.as_element() else {
+                continue;
+            };
+            let nid = crate::tree::NodeId::new(idx as u32);
+            tag_map.entry(name.local.to_string()).or_default().push(nid);
+            if let Some(attrs) = node.attrs() {
+                for attr in attrs {
+                    map.entry(attr.name.local.to_string())
+                        .or_default()
+                        .push(nid);
+                }
+            }
+        }
+        *self.inner.borrow().attr_index.borrow_mut() =
+            Some(crate::tree::AttrIndexCache { gen, map, tag_map });
+    }
+
     pub fn query_selector_from(
         &self,
         root: NodeId,
@@ -731,7 +777,20 @@ impl DomTree {
             MatchingForInvalidation::No,
         );
 
-        for desc_id in self.descendants(root) {
+        let candidates = match selector_list.slice().first() {
+            Some(sel) => {
+                let keys = SubjectKeys::from_vec(subject_keys(sel));
+                match keys.key() {
+                    SelectorKey::Attribute(_) | SelectorKey::Local(_) => self
+                        .indexed_candidates(keys.key())
+                        .unwrap_or_else(|| self.descendants(root)),
+                    _ => self.descendants(root),
+                }
+            }
+            None => Vec::new(),
+        };
+
+        for desc_id in candidates {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -774,7 +833,20 @@ impl DomTree {
         );
         let mut results = Vec::new();
 
-        for desc_id in self.descendants(root) {
+        let candidates = match selector_list.slice().first() {
+            Some(sel) => {
+                let keys = SubjectKeys::from_vec(subject_keys(sel));
+                match keys.key() {
+                    SelectorKey::Attribute(_) | SelectorKey::Local(_) => self
+                        .indexed_candidates(keys.key())
+                        .unwrap_or_else(|| self.descendants(root)),
+                    _ => self.descendants(root),
+                }
+            }
+            None => Vec::new(),
+        };
+
+        for desc_id in candidates {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -1128,6 +1200,17 @@ impl CompiledSelector {
 enum SubjectKeys {
     One(SelectorKey),
     Many(Box<[SelectorKey]>),
+}
+
+impl SubjectKeys {
+    /// Single-bucket key for index selection: the one subject key, or
+    /// Universal when the selector has disjoint alternatives.
+    fn key(&self) -> &SelectorKey {
+        match self {
+            SubjectKeys::One(key) => key,
+            SubjectKeys::Many(_) => &SelectorKey::Universal,
+        }
+    }
 }
 
 impl SubjectKeys {
