@@ -807,10 +807,41 @@ impl ObscuraJsRuntime {
         name: &'static str,
         source: String,
     ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        self.execute_runtime_script_bounded(name, source, INTERNAL_TASK_WATCHDOG_MS, true)
+    }
+
+    /// Execute a script with the shared watchdog armed for `budget_ms` and
+    /// the page-pathology latch honored. Script::Run ends with a microtask
+    /// checkpoint that drains page promise jobs, so even a trivial-looking
+    /// internal script can run arbitrary page JS — every runtime script goes
+    /// through here. `count_toward_latch` is false for CDP client
+    /// expressions: a client evaluating `while(true){}` says nothing about
+    /// the page's own health.
+    fn execute_runtime_script_bounded(
+        &mut self,
+        name: &'static str,
+        source: String,
+        budget_ms: u64,
+        count_toward_latch: bool,
+    ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        if self.js_latched_off() {
+            return Err("page JS latched off after repeated terminations".to_string());
+        }
+        let watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(budget_ms),
+        );
         let result = self
             .runtime
             .execute_script(name, source)
             .map_err(|error| error.to_string());
+        if crate::cdp_watchdog::disarm(watchdog) {
+            self.cancel_termination();
+            if count_toward_latch {
+                self.note_termination();
+            }
+            return Err("script exceeded its task budget; execution terminated".to_string());
+        }
         self.finish_heap_checked(result)
     }
 
@@ -1505,19 +1536,7 @@ impl ObscuraJsRuntime {
         // livelocked in a retry loop spins there with no outer watchdog
         // armed, wedging the render thread (observed: Shopify product pages
         // via has_pending_load_delaying_scripts between event-loop ticks).
-        let watchdog = crate::cdp_watchdog::arm(
-            self.isolate_handle(),
-            std::time::Duration::from_millis(budget_ms),
-        );
-        let result = self.execute_runtime_script("<eval>", wrapped);
-        let fired = crate::cdp_watchdog::disarm(watchdog);
-        if fired {
-            self.cancel_termination();
-            self.note_termination();
-            return Err(
-                "JS error: evaluation exceeded its task budget; execution terminated".to_string(),
-            );
-        }
+        let result = self.execute_runtime_script_bounded("<eval>", wrapped, budget_ms, true);
         let result = result.map_err(|e| format!("JS error: {}", e))?;
         self.v8_to_json(result)
     }
@@ -1604,7 +1623,7 @@ impl ObscuraJsRuntime {
         };
 
         let result = self
-            .execute_runtime_script("<eval-remote>", meta_code)
+            .execute_runtime_script_bounded("<eval-remote>", meta_code, await_timeout_ms, false)
             .map_err(|e| format!("JS error: {}", e))?;
 
         let meta_str = if await_promise {
@@ -1750,7 +1769,7 @@ impl ObscuraJsRuntime {
                 done_counter = done_counter,
             );
 
-            self.execute_runtime_script("<callFnAsync>", code)
+            self.execute_runtime_script_bounded("<callFnAsync>", code, await_timeout_ms, false)
                 .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
@@ -1827,7 +1846,7 @@ impl ObscuraJsRuntime {
                 args = args_list,
             );
             let result = self
-                .execute_runtime_script("<callFnByValue>", code)
+                .execute_runtime_script_bounded("<callFnByValue>", code, await_timeout_ms, false)
                 .map_err(|e| format!("JS error: {}", e))?;
             let json_val = self.v8_to_json(result)?;
             return Ok(Self::info_from_json(&json_val));
@@ -1850,7 +1869,7 @@ impl ObscuraJsRuntime {
             meta_fn = Self::meta_extract_js("__result"),
         );
         let result = self
-            .execute_runtime_script("<callFnRemote>", code)
+            .execute_runtime_script_bounded("<callFnRemote>", code, await_timeout_ms, false)
             .map_err(|e| format!("JS error: {}", e))?;
         let meta_str = self.v8_to_json(result)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -2273,11 +2292,24 @@ impl ObscuraJsRuntime {
     }
 
     pub fn execute_script_guarded(&mut self, name: &str, source: &str) -> Result<(), String> {
-        if source.len() < 10_000 {
-            self.execute_script(name, source)
-        } else {
-            self.execute_script_with_timeout(name, source, std::time::Duration::from_secs(5))
+        // Source length says nothing about execution time; guard every
+        // classic script with the shared (cheap) watchdog. A killed script
+        // is tolerated, matching the old 5s-timeout behavior.
+        if self.js_latched_off() {
+            return Ok(());
         }
+        let watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
+        );
+        let result = self.execute_classic_script(name, source);
+        if crate::cdp_watchdog::disarm(watchdog) {
+            self.cancel_termination();
+            self.note_termination();
+            tracing::warn!("Script killed after exceeding its task budget");
+            return Ok(());
+        }
+        result
     }
 
     pub fn execute_script_with_timeout(
@@ -2483,6 +2515,27 @@ impl ObscuraJsRuntime {
     /// No-op when the isolate is not terminating.
     pub fn cancel_termination(&mut self) {
         self.runtime.v8_isolate().cancel_terminate_execution();
+    }
+
+    /// Suppress V8's automatic microtask drains for a stretch of internal API
+    /// manipulation. Every `v8::Object::Set` fires the isolate's call-completed
+    /// callback, which runs the page's queued microtasks — internal engine
+    /// work (realm setup, shim installation) must never execute page JS: a
+    /// pathological page's queued microtasks livelock there, bypassing every
+    /// script-entry watchdog (observed: iframe realm attach on Shopify pages).
+    /// Explicit policy means microtasks run only via deliberate
+    /// `perform_microtask_checkpoint` calls. Pair with [`Self::restore_microtasks`].
+    pub(crate) fn suppress_microtasks(&mut self) -> deno_core::v8::MicrotasksPolicy {
+        let isolate = self.runtime.v8_isolate();
+        let previous = isolate.get_microtasks_policy();
+        isolate.set_microtasks_policy(deno_core::v8::MicrotasksPolicy::Explicit);
+        previous
+    }
+
+    pub(crate) fn restore_microtasks(&mut self, previous: deno_core::v8::MicrotasksPolicy) {
+        self.runtime
+            .v8_isolate()
+            .set_microtasks_policy(previous);
     }
 
     /// Drive the event loop for at most `budget_ms`, bounded against BOTH async
@@ -2910,6 +2963,9 @@ impl ObscuraJsRuntime {
         let deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_total_ms);
         let mut tick_ms: u64 = 1;
+        if self.js_latched_off() {
+            return false;
+        }
         loop {
             self.begin_javascript_task();
             if done_check(self) {
@@ -2920,12 +2976,23 @@ impl ObscuraJsRuntime {
             }
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
+            // Guard the slice: tokio's timeout cannot preempt synchronous
+            // page JS running inside the pump.
+            let pump_watchdog = crate::cdp_watchdog::arm(
+                self.isolate_handle(),
+                std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
+            );
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_millis(tick_ms),
                 self.runtime
                     .run_event_loop(deno_core::PollEventLoopOptions::default()),
             )
             .await;
+            if crate::cdp_watchdog::disarm(pump_watchdog) {
+                self.cancel_termination();
+                self.note_termination();
+                return false;
+            }
             if self.recover_heap_limit() {
                 return false;
             }
