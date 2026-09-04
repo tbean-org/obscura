@@ -150,7 +150,15 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    /// Watchdog terminations so far. Past TERMINATION_LATCH_THRESHOLD the page
+    /// is declared pathological: it livelocks in bursts (terminate -> revive ->
+    /// re-loop), so every later JS entry becomes a no-op and the render
+    /// completes capped instead of cycling until the hard deadline.
+    termination_count: std::cell::Cell<u32>,
 }
+
+/// Terminations before the page's JS is disabled for the rest of the render.
+const TERMINATION_LATCH_THRESHOLD: u32 = 3;
 
 /// Renders a caught V8 exception as a message for realm evaluation errors.
 fn exception_text(
@@ -360,6 +368,7 @@ impl ObscuraJsRuntime {
             module_load_activity,
             isolate_handle,
             heap_limit_state,
+            termination_count: std::cell::Cell::new(0),
             module_evaluations: HashMap::new(),
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
@@ -509,6 +518,9 @@ impl ObscuraJsRuntime {
         source: &str,
     ) -> Result<String, String> {
         use deno_core::v8;
+        if self.js_latched_off() {
+            return Ok(String::new());
+        }
 
         let isolate = self.runtime.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
@@ -1451,11 +1463,32 @@ impl ObscuraJsRuntime {
     }
 
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        if self.js_latched_off() {
+            return Ok(serde_json::Value::Null);
+        }
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
-        let result = self
-            .execute_runtime_script("<eval>", wrapped)
-            .map_err(|e| format!("JS error: {}", e))?;
+        // A probe's own script is trivial, but Script::Run ends with a
+        // microtask checkpoint that drains page promise jobs — a page
+        // livelocked in a retry loop spins there with no outer watchdog
+        // armed, wedging the render thread (observed: Shopify product pages
+        // via has_pending_load_delaying_scripts between event-loop ticks).
+        let watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(
+                SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS,
+            ),
+        );
+        let result = self.execute_runtime_script("<eval>", wrapped);
+        let fired = crate::cdp_watchdog::disarm(watchdog);
+        if fired {
+            self.cancel_termination();
+            self.note_termination();
+            return Err(
+                "JS error: evaluation exceeded its task budget; execution terminated".to_string(),
+            );
+        }
+        let result = result.map_err(|e| format!("JS error: {}", e))?;
         self.v8_to_json(result)
     }
 
@@ -2093,6 +2126,9 @@ impl ObscuraJsRuntime {
         prepared: PreparedModule,
         budget_ms: u64,
     ) -> Result<(), String> {
+        if self.js_latched_off() {
+            return Ok(());
+        }
         let PreparedModule {
             module_id,
             description,
@@ -2136,6 +2172,9 @@ impl ObscuraJsRuntime {
     }
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        if self.js_latched_off() {
+            return Ok(());
+        }
         self.begin_javascript_task();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
@@ -2258,6 +2297,7 @@ impl ObscuraJsRuntime {
             Ok(()) => Ok(()),
             Err(msg) => {
                 if msg.contains("Uncaught Error: execution terminated") {
+                    self.note_termination();
                     tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
                     Ok(())
                 } else {
@@ -2268,12 +2308,24 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
+        if self.js_latched_off() {
+            return Ok(());
+        }
         self.begin_javascript_task();
         // A browser performs a microtask checkpoint at the end of each task.
         // deno_core's event loop may return immediately when no async op is
         // pending, leaving an already-resolved Promise continuation stranded
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
+        // Bounded like the cooperative tick: callers wrap this in a tokio
+        // timeout, which cannot preempt a synchronous page-JS burst (the
+        // network-idle wait wedges there otherwise).
+        let watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(
+                SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS,
+            ),
+        );
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         let result = self
             .runtime
@@ -2281,6 +2333,12 @@ impl ObscuraJsRuntime {
             .await
             .map_err(|e| format!("Event loop error: {}", e));
         self.runtime.v8_isolate().perform_microtask_checkpoint();
+        let fired = crate::cdp_watchdog::disarm(watchdog);
+        if fired {
+            self.cancel_termination();
+            self.note_termination();
+            return Err("event-loop drain exceeded its task budget; execution terminated".into());
+        }
         self.finish_heap_checked(result)
     }
 
@@ -2358,9 +2416,29 @@ impl ObscuraJsRuntime {
         let fired = token.stop();
         if fired {
             self.runtime.v8_isolate().cancel_terminate_execution();
+            self.note_termination();
             tracing::warn!("V8 watchdog fired: terminated a synchronous overrun");
         }
         fired
+    }
+
+    /// Record one watchdog termination and return whether the page's JS is
+    /// now latched off for the rest of the render.
+    fn note_termination(&self) -> bool {
+        let n = self.termination_count.get() + 1;
+        self.termination_count.set(n);
+        if n == TERMINATION_LATCH_THRESHOLD {
+            tracing::warn!(
+                "page JS disabled after {n} watchdog terminations; render will complete capped"
+            );
+        }
+        n >= TERMINATION_LATCH_THRESHOLD
+    }
+
+    /// True once the page has tripped enough watchdogs that running more of
+    /// its JS can only re-livelock. Checked at every JS entry point.
+    pub fn js_latched_off(&self) -> bool {
+        self.termination_count.get() >= TERMINATION_LATCH_THRESHOLD
     }
 
     /// This runtime's V8 isolate handle (captured at construction, stable for
@@ -2426,7 +2504,13 @@ impl ObscuraJsRuntime {
         let fired = self.disarm_watchdog(token);
         match result {
             Err(error) if error.contains("heap limit exceeded") => Err(error),
-            Err(error) if fired || error.contains("execution terminated") => Ok(()),
+            Err(error)
+                if fired
+                    || error.contains("execution terminated")
+                    || error.contains("exceeded its task budget") =>
+            {
+                Ok(())
+            }
             other => other,
         }
     }
@@ -2460,13 +2544,46 @@ impl ObscuraJsRuntime {
     /// ready, it remains parked on deno_core's real I/O/timer waker, so the
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
+        // One event-loop turn can synchronously drain an arbitrarily long
+        // chain of timer/microtask callbacks; tokio's timeout cannot preempt
+        // that native V8 call. Bound the synchronous entry the same way the
+        // autonomous turn does, or a page whose timer callback loops forever
+        // wedges the render thread past every outer deadline (observed:
+        // Shopify product pages livelocking in a jQuery re-eval handler).
+        const TICK_TASK_WATCHDOG_MS: u64 =
+            SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
+        if self.js_latched_off() {
+            return Ok(true);
+        }
         self.begin_javascript_task();
+        let checkpoint_watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(TICK_TASK_WATCHDOG_MS),
+        );
         self.runtime.v8_isolate().perform_microtask_checkpoint();
+        if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
+            self.cancel_termination();
+            self.note_termination();
+            return Err("cooperative tick microtask checkpoint exceeded its task budget".into());
+        }
+        let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
+            let watchdog = crate::cdp_watchdog::arm(
+                isolate_handle.clone(),
+                std::time::Duration::from_millis(TICK_TASK_WATCHDOG_MS),
+            );
             let tick = self
                 .runtime
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
+            if watchdog_fired {
+                self.runtime.v8_isolate().cancel_terminate_execution();
+                self.note_termination();
+                return std::task::Poll::Ready(Err(
+                    "cooperative event-loop task exceeded its task budget".into(),
+                ));
+            }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
@@ -2680,7 +2797,13 @@ impl ObscuraJsRuntime {
         let fired = self.disarm_watchdog(token);
         match result {
             Err(error) if error.contains("heap limit exceeded") => Err(error),
-            Err(error) if fired || error.contains("execution terminated") => Ok(()),
+            Err(error)
+                if fired
+                    || error.contains("execution terminated")
+                    || error.contains("exceeded its task budget") =>
+            {
+                Ok(())
+            }
             other => other,
         }
     }

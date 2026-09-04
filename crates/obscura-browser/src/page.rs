@@ -2524,10 +2524,16 @@ impl Page {
             // dynamic script elements do not gate it. They do remain in the
             // document's load-event delay set, including scripts inserted by
             // a DOMContentLoaded listener.
-            let _ = js.execute_script(
+            // Bounded: the dispatch runs page listeners synchronously, and by
+            // here every phase watchdog (which is one-shot) may already be
+            // spent — an unbounded listener loop wedges the render past the
+            // hard deadline (observed: Shopify product pages whose DCL
+            // handler re-evals a failing script forever).
+            let _ = js.execute_script_with_timeout(
                 "<dom-content-loaded>",
                 "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+                std::time::Duration::from_secs(5),
             );
 
             let load_blockers_finished =
@@ -2540,12 +2546,14 @@ impl Page {
 
             // readyState becomes complete before the load event. A script
             // inserted by an onload handler is therefore post-load work and
-            // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
+            // remains pending until an explicit caller settle/wait. Bounded
+            // for the same reason as the DOMContentLoaded dispatch above.
+            let _ = js.execute_script_with_timeout(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
                  if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
                  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
+                std::time::Duration::from_secs(5),
             );
         }
         if let Some(token) = exec_wd {

@@ -696,49 +696,118 @@ impl DomTree {
         self.query_selector_all_from(self.document(), selector)
     }
 
-    /// Element ids carrying attribute `name`, from the generation-gated
-    /// attribute index. Rebuilds the index once per mutation generation, so a
-    /// static page (the querySelectorAll polling case) pays one scan total and
-    /// a mutating page never reads a stale index.
-    fn indexed_candidates(&self, key: &SelectorKey) -> Option<Vec<crate::tree::NodeId>> {
-        let gen = self.inner.borrow().mutation_gen.get();
-        let fresh = matches!(
-            &*self.inner.borrow().attr_index.borrow(),
-            Some(cache) if cache.gen == gen
-        );
-        if !fresh {
-            self.rebuild_attr_index(gen);
-        }
-        let tree = self.inner.borrow();
-        let index = tree.attr_index.borrow();
-        let cache = index.as_ref()?;
-        match key {
-            SelectorKey::Attribute(name) => Some(cache.map.get(name).cloned().unwrap_or_default()),
-            SelectorKey::Local(tag) => Some(cache.tag_map.get(tag).cloned().unwrap_or_default()),
-            _ => None,
-        }
-    }
 
     fn rebuild_attr_index(&self, gen: u64) {
-        let mut map: HashMap<String, Vec<crate::tree::NodeId>> = HashMap::new();
-        let mut tag_map: HashMap<String, Vec<crate::tree::NodeId>> = HashMap::new();
+        // Document-order sequence first: descendants() borrows inner per
+        // call, so compute it before holding the borrow for the map scan.
+        let doc = self.document();
+        let order_list = self.descendants(doc);
+        let mut map: HashMap<LocalName, Vec<crate::tree::NodeId>> = HashMap::new();
+        let mut tag_map: HashMap<LocalName, Vec<crate::tree::NodeId>> = HashMap::new();
+        let mut order = vec![u32::MAX; self.inner.borrow().nodes.len()];
+        for (seq, nid) in order_list.into_iter().enumerate() {
+            order[nid.index()] = seq as u32;
+        }
         for (idx, slot) in self.inner.borrow().nodes.iter().enumerate() {
             let Some(node) = slot.as_ref() else { continue };
             let Some(name) = node.as_element() else {
                 continue;
             };
             let nid = crate::tree::NodeId::new(idx as u32);
-            tag_map.entry(name.local.to_string()).or_default().push(nid);
+            tag_map.entry(name.local.clone()).or_default().push(nid);
             if let Some(attrs) = node.attrs() {
                 for attr in attrs {
-                    map.entry(attr.name.local.to_string())
-                        .or_default()
-                        .push(nid);
+                    map.entry(attr.name.local.clone()).or_default().push(nid);
                 }
             }
         }
-        *self.inner.borrow().attr_index.borrow_mut() =
-            Some(crate::tree::AttrIndexCache { gen, map, tag_map });
+        *self.inner.borrow().attr_index.borrow_mut() = Some(crate::tree::AttrIndexCache {
+            gen,
+            map,
+            tag_map,
+            order,
+        });
+    }
+
+    /// Indexed candidates restricted to `root`'s subtree. The index spans the
+    /// whole node arena, including detached trees, so an unfiltered lookup
+    /// leaks nodes from outside the query root (e.g. a detached document's
+    /// title into the main document's `querySelector("title")`).
+    fn scoped_indexed_candidates(&self, key: &SelectorKey, root: NodeId) -> Option<Vec<NodeId>> {
+        if self.inner.borrow().attr_index_disabled.get() {
+            return None;
+        }
+        let gen = self.inner.borrow().mutation_gen.get();
+        let fresh = matches!(
+            &*self.inner.borrow().attr_index.borrow(),
+            Some(cache) if cache.gen == gen
+        );
+        {
+            let inner = self.inner.borrow();
+            let (queries, rebuilds) = inner.attr_index_stats.get();
+            let (q, r) = (queries + 1, rebuilds + u64::from(!fresh));
+            inner.attr_index_stats.set((q, r));
+            // Sustained churn: a rebuild every other query means the page
+            // mutates constantly and the rebuild cost outweighs the scan.
+            if r > 64 && r * 2 > q {
+                inner.attr_index_disabled.set(true);
+                return None;
+            }
+        }
+        if !fresh {
+            self.rebuild_attr_index(gen);
+        }
+        let tree = self.inner.borrow();
+        let index = tree.attr_index.borrow();
+        let cache = index.as_ref()?;
+        let candidates = match key {
+            SelectorKey::Attribute(name) => cache.map.get(&LocalName::from(name.as_str())),
+            SelectorKey::Local(tag) => cache.tag_map.get(&LocalName::from(tag.as_str())),
+            _ => None,
+        };
+        let doc = self.document();
+        let mut scoped: Vec<NodeId> = if root == doc {
+            // order[u32::MAX] marks nodes outside the document tree, so the
+            // common document-scoped query needs no parent walk at all.
+            candidates
+                .map(|c| c.as_slice())
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|&nid| {
+                    cache.order.get(nid.index()).copied().unwrap_or(u32::MAX) != u32::MAX
+                })
+                .collect()
+        } else {
+            candidates
+                .map(|c| c.as_slice())
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|&nid| {
+                    let mut cur = tree
+                        .nodes
+                        .get(nid.index())
+                        .and_then(|n| n.as_ref())
+                        .and_then(|n| n.parent);
+                    while let Some(id) = cur {
+                        if id == root {
+                            return true;
+                        }
+                        cur = tree
+                            .nodes
+                            .get(id.index())
+                            .and_then(|n| n.as_ref())
+                            .and_then(|n| n.parent);
+                    }
+                    false
+                })
+                .collect()
+        };
+        // Document order via the rebuild-time sequence (u32::MAX for
+        // detached/shadow nodes keeps their arena order under a stable sort).
+        scoped.sort_by_key(|&nid| cache.order.get(nid.index()).copied().unwrap_or(u32::MAX));
+        Some(scoped)
     }
 
     pub fn query_selector_from(
@@ -777,17 +846,20 @@ impl DomTree {
             MatchingForInvalidation::No,
         );
 
-        let candidates = match selector_list.slice().first() {
-            Some(sel) => {
+        // Index fast path applies to a single-selector list only: with a
+        // comma list each alternative needs its own bucket and first-match
+        // must stay in tree order, so fall back to the descendant scan.
+        let candidates = match selector_list.slice() {
+            [sel] => {
                 let keys = SubjectKeys::from_vec(subject_keys(sel));
                 match keys.key() {
                     SelectorKey::Attribute(_) | SelectorKey::Local(_) => self
-                        .indexed_candidates(keys.key())
+                        .scoped_indexed_candidates(keys.key(), root)
                         .unwrap_or_else(|| self.descendants(root)),
                     _ => self.descendants(root),
                 }
             }
-            None => Vec::new(),
+            _ => self.descendants(root),
         };
 
         for desc_id in candidates {
@@ -833,17 +905,20 @@ impl DomTree {
         );
         let mut results = Vec::new();
 
-        let candidates = match selector_list.slice().first() {
-            Some(sel) => {
+        // Index fast path applies to a single-selector list only: with a
+        // comma list each alternative needs its own bucket and first-match
+        // must stay in tree order, so fall back to the descendant scan.
+        let candidates = match selector_list.slice() {
+            [sel] => {
                 let keys = SubjectKeys::from_vec(subject_keys(sel));
                 match keys.key() {
                     SelectorKey::Attribute(_) | SelectorKey::Local(_) => self
-                        .indexed_candidates(keys.key())
+                        .scoped_indexed_candidates(keys.key(), root)
                         .unwrap_or_else(|| self.descendants(root)),
                     _ => self.descendants(root),
                 }
             }
-            None => Vec::new(),
+            _ => self.descendants(root),
         };
 
         for desc_id in candidates {
