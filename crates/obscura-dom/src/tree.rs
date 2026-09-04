@@ -245,7 +245,19 @@ impl Node {
 }
 
 pub struct DomTree {
-    inner: RefCell<DomTreeInner>,
+    pub(crate) inner: RefCell<DomTreeInner>,
+}
+
+/// Attribute-name -> element node ids, rebuilt lazily whenever the tree's
+/// mutation generation has advanced past the cache's generation. Selector
+/// queries with a required attribute in the subject (e.g. `[name^="x"]`) use
+/// the indexed candidate set instead of a full descendant scan — the difference
+/// between a page script polling querySelectorAll every few ms being cheap and
+/// it saturating the engine thread.
+pub(crate) struct AttrIndexCache {
+    pub(crate) gen: u64,
+    pub(crate) map: HashMap<String, Vec<NodeId>>,
+    pub(crate) tag_map: HashMap<String, Vec<NodeId>>,
 }
 
 pub(crate) struct DomTreeInner {
@@ -253,6 +265,8 @@ pub(crate) struct DomTreeInner {
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    pub(crate) mutation_gen: std::cell::Cell<u64>,
+    pub(crate) attr_index: RefCell<Option<AttrIndexCache>>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
     /// into a shadow tree by accident.
@@ -284,6 +298,8 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                mutation_gen: std::cell::Cell::new(0),
+                attr_index: RefCell::new(None),
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
@@ -325,6 +341,7 @@ impl DomTree {
         host: NodeId,
         mode: ShadowRootMode,
     ) -> Result<NodeId, AttachShadowError> {
+        self.bump_mutation_gen();
         {
             let inner = self.inner.borrow();
             let host_is_element = inner
@@ -564,7 +581,15 @@ impl DomTree {
         true
     }
 
+    fn bump_mutation_gen(&self) {
+        self.inner
+            .borrow()
+            .mutation_gen
+            .set(self.inner.borrow().mutation_gen.get() + 1);
+    }
+
     pub fn new_node(&self, data: NodeData) -> NodeId {
+        self.bump_mutation_gen();
         let mut inner = self.inner.borrow_mut();
         let id = if let Some(slot) = inner.free_list.pop() {
             NodeId(slot)
@@ -612,11 +637,13 @@ impl DomTree {
     where
         F: FnOnce(&mut Node) -> R,
     {
+        self.bump_mutation_gen();
         let mut inner = self.inner.borrow_mut();
         inner.nodes.get_mut(id.index())?.as_mut().map(f)
     }
 
     pub fn append_child(&self, parent_id: NodeId, child_id: NodeId) {
+        self.bump_mutation_gen();
         // Per DOM spec, appending a node to itself is a HierarchyRequestError;
         // here we treat it as a no-op rather than panic. Without this the
         // sibling-pointer fixup below sets the node's prev_sibling to itself
@@ -702,6 +729,7 @@ impl DomTree {
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
+        self.bump_mutation_gen();
         // Per DOM spec: if the node being inserted IS the reference node,
         // the operation is a no-op (the node is already in its target
         // position). Without this, the linked-list fixup below sets the
@@ -785,6 +813,7 @@ impl DomTree {
     }
 
     pub fn detach(&self, node_id: NodeId) {
+        self.bump_mutation_gen();
         self.detach_for_reparent(node_id, true);
     }
 
@@ -842,6 +871,7 @@ impl DomTree {
     /// Unlike `remove()`, this does NOT free the nodes — the JS side may
     /// still hold references to the wrappers.
     pub fn remove_child(&self, node_id: NodeId) {
+        self.bump_mutation_gen();
         // Collect all id attribute values in the subtree. We snapshot them
         // before detaching so `get_attribute` can still see the tree.
         let ids_to_remove: Vec<String> = {
@@ -872,6 +902,7 @@ impl DomTree {
     }
 
     pub fn remove(&self, node_id: NodeId) {
+        self.bump_mutation_gen();
         let nodes_to_remove = self.inclusive_owned_subtrees(node_id);
         if nodes_to_remove.is_empty() {
             return;
@@ -1333,9 +1364,12 @@ impl DomTree {
     }
 
     pub fn append_text(&self, parent_id: NodeId, text: &str) {
+        self.bump_mutation_gen();
         let last_child_is_text = {
             let inner = self.inner.borrow();
-            inner.nodes.get(parent_id.index())
+            inner
+                .nodes
+                .get(parent_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.last_child)
                 .and_then(|lc| inner.nodes.get(lc.index()))
@@ -1395,6 +1429,7 @@ impl DomTree {
     }
 
     pub fn import_children_from(&self, parent_id: NodeId, source: &DomTree, source_node: NodeId) {
+        self.bump_mutation_gen();
         let source_children = source.children(source_node);
         for source_child_id in source_children {
             self.import_node_from(parent_id, source, source_child_id);
@@ -1409,6 +1444,7 @@ impl DomTree {
     /// element type and namespace. Template contents are stored in a separate
     /// document node and therefore need their own remapped clone.
     pub fn clone_node(&self, source_node_id: NodeId, deep: bool) -> Option<NodeId> {
+        self.bump_mutation_gen();
         // DOM cloneNode is not defined for ShadowRoot nodes. A host clone keeps
         // its light subtree only; the separate registry means the shadow root
         // is naturally omitted from that traversal.
