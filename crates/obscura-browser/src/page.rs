@@ -239,7 +239,6 @@ pub struct Page {
     /// at the end of settle). Bounds total JS activity for abusive pages whose
     /// timers never let the event loop go quiet, so the render completes
     /// capped instead of exhausting every phase budget.
-    pub total_script_wd: Option<obscura_js::runtime::WatchdogToken>,
     /// Optional CDP physical-screen override. This is separate from the CSS
     /// viewport and survives navigation, matching device-metrics emulation.
     screen_size_override: Option<(f32, f32)>,
@@ -922,7 +921,6 @@ impl Page {
             title: String::new(),
             referrer: String::new(),
             viewport: (1280.0, 720.0),
-            total_script_wd: None,
             screen_size_override: None,
             screen_metrics_emulated: false,
             device_metrics_baseline: None,
@@ -1811,21 +1809,6 @@ impl Page {
         let script_deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
 
-        // Whole-page script budget: the per-phase guards all bound synchronous
-        // work, but an interval script that yields between ticks never trips
-        // them. If JS is still running when this fires, terminate it — the
-        // render completes capped (nav finishes, settle goes quiet) instead of
-        // every phase exhausting its budget and the render dying at the hard
-        // timeout.
-        let total_script_budget_ms: u64 = std::env::var("OBSCURA_TOTAL_SCRIPT_BUDGET_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(15_000);
-        self.total_script_wd = self
-            .js
-            .as_mut()
-            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(total_script_budget_ms)));
-
         // Hard backstop over the WHOLE script-execution phase. Inline scripts
         // run back-to-back with no await between them, so neither the soft
         // deadline above (only checked between scripts) nor the per-script guard
@@ -2631,11 +2614,6 @@ impl Page {
     /// timer-driven tests and dynamic pages.
     pub async fn settle(&mut self, max_ms: u64) {
         if max_ms == 0 {
-            if let Some(token) = self.total_script_wd.take() {
-                if let Some(js) = self.js.as_mut() {
-                    js.disarm_watchdog(token);
-                }
-            }
             return;
         }
         let settle_started = std::time::Instant::now();
@@ -2679,11 +2657,6 @@ impl Page {
                 remaining_settle_resource_warmup_ms(max_ms, settle_started.elapsed(), warmup_ms);
             if remaining_ms != 0 {
                 let _ = self.prepare_screenshot_resources(remaining_ms).await;
-            }
-        }
-        if let Some(token) = self.total_script_wd.take() {
-            if let Some(js) = self.js.as_mut() {
-                js.disarm_watchdog(token);
             }
         }
     }
