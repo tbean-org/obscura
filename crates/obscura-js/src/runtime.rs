@@ -1531,7 +1531,14 @@ impl ObscuraJsRuntime {
         count_toward_latch: bool,
     ) -> Result<serde_json::Value, String> {
         if self.js_latched_off() {
-            return Ok(serde_json::Value::Null);
+            // Internal probes degrade quietly so the capped render can
+            // finish; CDP clients get the same explicit error as every
+            // other CDP path instead of a flag-dependent silent null.
+            return if count_toward_latch {
+                Ok(serde_json::Value::Null)
+            } else {
+                Err("page JS latched off after repeated terminations".to_string())
+            };
         }
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
@@ -1633,15 +1640,27 @@ impl ObscuraJsRuntime {
 
         let meta_str = if await_promise {
             let __t0 = std::time::Instant::now();
+            let settle_deadline = tokio::time::Instant::now()
+                + tokio::time::Duration::from_millis(await_timeout_ms);
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
             let settled = self
                 .resolve_promises_until(
                     |rt| {
-                        rt.execute_runtime_script("<done?>", sentinel.clone())
-                            .ok()
-                            .and_then(|v| rt.v8_to_json(v).ok())
-                            .and_then(|j| j.as_bool())
-                            .unwrap_or(false)
+                        let budget_ms = settle_deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis()
+                            .min(INTERNAL_TASK_WATCHDOG_MS as u128)
+                            .max(1) as u64;
+                        rt.execute_runtime_script_bounded(
+                            "<done?>",
+                            sentinel.clone(),
+                            budget_ms,
+                            false,
+                        )
+                        .ok()
+                        .and_then(|v| rt.v8_to_json(v).ok())
+                        .and_then(|j| j.as_bool())
+                        .unwrap_or(false)
                     },
                     await_timeout_ms,
                     false,
@@ -1779,15 +1798,27 @@ impl ObscuraJsRuntime {
                 .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
+            let settle_deadline = tokio::time::Instant::now()
+                + tokio::time::Duration::from_millis(await_timeout_ms);
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
             let settled = self
                 .resolve_promises_until(
                     |rt| {
-                        rt.execute_runtime_script("<done?>", sentinel.clone())
-                            .ok()
-                            .and_then(|v| rt.v8_to_json(v).ok())
-                            .and_then(|j| j.as_bool())
-                            .unwrap_or(false)
+                        let budget_ms = settle_deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis()
+                            .min(INTERNAL_TASK_WATCHDOG_MS as u128)
+                            .max(1) as u64;
+                        rt.execute_runtime_script_bounded(
+                            "<done?>",
+                            sentinel.clone(),
+                            budget_ms,
+                            false,
+                        )
+                        .ok()
+                        .and_then(|v| rt.v8_to_json(v).ok())
+                        .and_then(|j| j.as_bool())
+                        .unwrap_or(false)
                     },
                     await_timeout_ms,
                     false,
@@ -2985,10 +3016,17 @@ impl ObscuraJsRuntime {
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
             // Guard the slice: tokio's timeout cannot preempt synchronous
-            // page JS running inside the pump.
+            // page JS running inside the pump. Bound it by the remaining
+            // caller budget, capped at the internal ceiling, so a short
+            // caller timeout is honored even against a microtask livelock.
+            let pump_budget_ms = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(INTERNAL_TASK_WATCHDOG_MS as u128)
+                .max(1) as u64;
             let pump_watchdog = crate::cdp_watchdog::arm(
                 self.isolate_handle(),
-                std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
+                std::time::Duration::from_millis(pump_budget_ms),
             );
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_millis(tick_ms),
