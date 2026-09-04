@@ -305,10 +305,22 @@ impl ObscuraJsRuntime {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+            // Cap each isolate's heap: the V8 default (~2Gi) lets one heavy page
+            // abort the whole process (Fatal JavaScript OOM, SIGTRAP) or OOM the
+            // pod when several runtimes share it. With a cap, the near-heap-limit
+            // guard below trips first and fails the render cleanly.
+            let max_heap_bytes = std::env::var("OBSCURA_MAX_HEAP_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1024 * 1024 * 1024);
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
                 module_loader: Some(module_loader),
                 startup_snapshot: Some(SNAPSHOT),
+                create_params: Some(
+                    deno_core::v8::Isolate::create_params()
+                        .heap_limits(0, max_heap_bytes),
+                ),
                 ..Default::default()
             });
 
