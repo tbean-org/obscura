@@ -160,6 +160,11 @@ pub struct ObscuraJsRuntime {
 /// Terminations before the page's JS is disabled for the rest of the render.
 const TERMINATION_LATCH_THRESHOLD: u32 = 3;
 
+/// Default ceiling for one uninterrupted internal JS task: the synchronous
+/// task floor plus the watchdog scheduling margin. Callers with their own
+/// timeout (CDP Runtime.evaluate) arm the watchdog from that instead.
+const INTERNAL_TASK_WATCHDOG_MS: u64 = SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
+
 /// Renders a caught V8 exception as a message for realm evaluation errors.
 fn exception_text(
     scope: &mut deno_core::v8::TryCatch<'_, deno_core::v8::HandleScope<'_>>,
@@ -522,21 +527,40 @@ impl ObscuraJsRuntime {
             return Ok(String::new());
         }
 
-        let isolate = self.runtime.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
-        let context = v8::Local::new(scope, realm);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        let scope = &mut v8::TryCatch::new(scope);
+        // Frame scripts run page JS too (advance_frames drives iframe
+        // preload/document/load-handler code through here, outside any
+        // event-loop watchdog), so bound them like every other entry point.
+        // The token is scoped to the V8 borrow so disarm can touch `self`.
+        let isolate_handle = self.isolate_handle();
+        let (watchdog, result) = {
+            let isolate = self.runtime.v8_isolate();
+            let scope = &mut v8::HandleScope::new(isolate);
+            let context = v8::Local::new(scope, realm);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let scope = &mut v8::TryCatch::new(scope);
 
-        let code = v8::String::new(scope, source).ok_or("source too large")?;
-        let script = match v8::Script::compile(scope, code, None) {
-            Some(script) => script,
-            None => return Err(exception_text(scope)),
+            let code = v8::String::new(scope, source).ok_or("source too large")?;
+            let script = match v8::Script::compile(scope, code, None) {
+                Some(script) => script,
+                None => return Err(exception_text(scope)),
+            };
+            let watchdog = crate::cdp_watchdog::arm(
+                isolate_handle,
+                std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
+            );
+            let run_result = script.run(scope);
+            let result = match run_result {
+                Some(value) => Ok(value.to_rust_string_lossy(scope)),
+                None => Err(exception_text(scope)),
+            };
+            (watchdog, result)
         };
-        match script.run(scope) {
-            Some(value) => Ok(value.to_rust_string_lossy(scope)),
-            None => Err(exception_text(scope)),
+        if crate::cdp_watchdog::disarm(watchdog) {
+            self.cancel_termination();
+            self.note_termination();
+            return Err("frame script exceeded its task budget; execution terminated".to_string());
         }
+        result
     }
 
     /// Copies the browser-identity globals from the main realm into `realm`.
@@ -1463,6 +1487,14 @@ impl ObscuraJsRuntime {
     }
 
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        self.evaluate_with_budget(expression, INTERNAL_TASK_WATCHDOG_MS)
+    }
+
+    fn evaluate_with_budget(
+        &mut self,
+        expression: &str,
+        budget_ms: u64,
+    ) -> Result<serde_json::Value, String> {
         if self.js_latched_off() {
             return Ok(serde_json::Value::Null);
         }
@@ -1475,9 +1507,7 @@ impl ObscuraJsRuntime {
         // via has_pending_load_delaying_scripts between event-loop ticks).
         let watchdog = crate::cdp_watchdog::arm(
             self.isolate_handle(),
-            std::time::Duration::from_millis(
-                SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS,
-            ),
+            std::time::Duration::from_millis(budget_ms),
         );
         let result = self.execute_runtime_script("<eval>", wrapped);
         let fired = crate::cdp_watchdog::disarm(watchdog);
@@ -1515,7 +1545,9 @@ impl ObscuraJsRuntime {
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
         if !await_promise && return_by_value {
-            let val = self.evaluate(expression)?;
+            // The caller asked for this timeout; a fixed internal ceiling
+            // would silently replace it and tokio cannot preempt sync V8.
+            let val = self.evaluate_with_budget(expression, await_timeout_ms)?;
             return Ok(Self::info_from_json(&val));
         }
         self.begin_javascript_task();
@@ -2322,9 +2354,7 @@ impl ObscuraJsRuntime {
         // network-idle wait wedges there otherwise).
         let watchdog = crate::cdp_watchdog::arm(
             self.isolate_handle(),
-            std::time::Duration::from_millis(
-                SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS,
-            ),
+            std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
         );
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         let result = self
@@ -2550,8 +2580,7 @@ impl ObscuraJsRuntime {
         // autonomous turn does, or a page whose timer callback loops forever
         // wedges the render thread past every outer deadline (observed:
         // Shopify product pages livelocking in a jQuery re-eval handler).
-        const TICK_TASK_WATCHDOG_MS: u64 =
-            SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
+        const TICK_TASK_WATCHDOG_MS: u64 = INTERNAL_TASK_WATCHDOG_MS;
         if self.js_latched_off() {
             return Ok(true);
         }
@@ -2617,6 +2646,9 @@ impl ObscuraJsRuntime {
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
         const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
+        if self.js_latched_off() {
+            return Ok(true);
+        }
 
         self.begin_javascript_task();
 
@@ -2627,6 +2659,7 @@ impl ObscuraJsRuntime {
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
             self.cancel_termination();
+            self.note_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
         }
         if self.recover_heap_limit() {
@@ -2646,6 +2679,7 @@ impl ObscuraJsRuntime {
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
                 self.runtime.v8_isolate().cancel_terminate_execution();
+                self.note_termination();
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
                 ));

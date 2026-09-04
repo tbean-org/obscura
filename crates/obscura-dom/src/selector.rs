@@ -766,6 +766,14 @@ impl DomTree {
             _ => None,
         };
         let doc = self.document();
+        // Outside the document tree the order map is all u32::MAX, so the
+        // sort would silently return arena order, not tree order. Fall back
+        // to the plain scan, which is correct for any root.
+        if root != doc
+            && cache.order.get(root.index()).copied().unwrap_or(u32::MAX) == u32::MAX
+        {
+            return None;
+        }
         let mut scoped: Vec<NodeId> = if root == doc {
             // order[u32::MAX] marks nodes outside the document tree, so the
             // common document-scoped query needs no parent walk at all.
