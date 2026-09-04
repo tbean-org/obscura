@@ -125,7 +125,9 @@ impl FrameRealm {
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
+            let prev = parent.suppress_microtasks();
             parent.publish_realm_objects(&realm.context, frame_id);
+            parent.restore_microtasks(prev);
         }
         Some(realm)
     }

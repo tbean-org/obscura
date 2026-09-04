@@ -539,19 +539,22 @@ impl ObscuraJsRuntime {
             let scope = &mut v8::ContextScope::new(scope, context);
             let scope = &mut v8::TryCatch::new(scope);
 
-            let code = v8::String::new(scope, source).ok_or("source too large")?;
-            let script = match v8::Script::compile(scope, code, None) {
-                Some(script) => script,
-                None => return Err(exception_text(scope)),
-            };
+            // Armed before compilation: a large or adversarial frame source
+            // can monopolize V8 while compiling, not only while running.
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle,
                 std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
             );
-            let run_result = script.run(scope);
-            let result = match run_result {
-                Some(value) => Ok(value.to_rust_string_lossy(scope)),
-                None => Err(exception_text(scope)),
+            let run_attempt = v8::String::new(scope, source)
+                .ok_or("source too large".to_string())
+                .and_then(|code| match v8::Script::compile(scope, code, None) {
+                    Some(script) => Ok(script.run(scope)),
+                    None => Err(exception_text(scope)),
+                });
+            let result = match run_attempt {
+                Ok(Some(value)) => Ok(value.to_rust_string_lossy(scope)),
+                Ok(None) => Err(exception_text(scope)),
+                Err(error) => Err(error),
             };
             (watchdog, result)
         };
@@ -1518,13 +1521,14 @@ impl ObscuraJsRuntime {
     }
 
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
-        self.evaluate_with_budget(expression, INTERNAL_TASK_WATCHDOG_MS)
+        self.evaluate_with_budget(expression, INTERNAL_TASK_WATCHDOG_MS, true)
     }
 
     fn evaluate_with_budget(
         &mut self,
         expression: &str,
         budget_ms: u64,
+        count_toward_latch: bool,
     ) -> Result<serde_json::Value, String> {
         if self.js_latched_off() {
             return Ok(serde_json::Value::Null);
@@ -1536,7 +1540,8 @@ impl ObscuraJsRuntime {
         // livelocked in a retry loop spins there with no outer watchdog
         // armed, wedging the render thread (observed: Shopify product pages
         // via has_pending_load_delaying_scripts between event-loop ticks).
-        let result = self.execute_runtime_script_bounded("<eval>", wrapped, budget_ms, true);
+        let result =
+            self.execute_runtime_script_bounded("<eval>", wrapped, budget_ms, count_toward_latch);
         let result = result.map_err(|e| format!("JS error: {}", e))?;
         self.v8_to_json(result)
     }
@@ -1566,7 +1571,7 @@ impl ObscuraJsRuntime {
         if !await_promise && return_by_value {
             // The caller asked for this timeout; a fixed internal ceiling
             // would silently replace it and tokio cannot preempt sync V8.
-            let val = self.evaluate_with_budget(expression, await_timeout_ms)?;
+            let val = self.evaluate_with_budget(expression, await_timeout_ms, false)?;
             return Ok(Self::info_from_json(&val));
         }
         self.begin_javascript_task();
@@ -1639,6 +1644,7 @@ impl ObscuraJsRuntime {
                             .unwrap_or(false)
                     },
                     await_timeout_ms,
+                    false,
                 )
                 .await;
             if !settled {
@@ -1784,6 +1790,7 @@ impl ObscuraJsRuntime {
                             .unwrap_or(false)
                     },
                     await_timeout_ms,
+                    false,
                 )
                 .await;
             if !settled {
@@ -2956,6 +2963,7 @@ impl ObscuraJsRuntime {
         &mut self,
         mut done_check: F,
         max_total_ms: u64,
+        count_toward_latch: bool,
     ) -> bool
     where
         F: FnMut(&mut Self) -> bool,
@@ -2990,7 +2998,9 @@ impl ObscuraJsRuntime {
             .await;
             if crate::cdp_watchdog::disarm(pump_watchdog) {
                 self.cancel_termination();
-                self.note_termination();
+                if count_toward_latch {
+                    self.note_termination();
+                }
                 return false;
             }
             if self.recover_heap_limit() {
