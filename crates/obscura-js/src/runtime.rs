@@ -1575,10 +1575,28 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
+        // One absolute deadline for the whole request: execution draws its
+        // remainder and serialization draws what is left after that, never
+        // the full timeout twice.
+        let cdp_deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(await_timeout_ms);
         if !await_promise && return_by_value {
             // The caller asked for this timeout; a fixed internal ceiling
             // would silently replace it and tokio cannot preempt sync V8.
-            let val = self.evaluate_with_budget(expression, await_timeout_ms, false)?;
+            let wrapped = Self::wrap_expression(expression);
+            let result = self
+                .execute_runtime_script_bounded(
+                    "<eval>",
+                    wrapped,
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
+                )
+                .map_err(|e| format!("JS error: {}", e))?;
+            let val = self.v8_to_json_bounded(
+                result,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )?;
             return Ok(Self::info_from_json(&val));
         }
         self.begin_javascript_task();
@@ -1634,8 +1652,6 @@ impl ObscuraJsRuntime {
             )
         };
 
-        let cdp_deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_millis(await_timeout_ms);
         let result = self
             .execute_runtime_script_bounded(
                 "<eval-remote>",
@@ -1934,9 +1950,18 @@ impl ObscuraJsRuntime {
                 args = args_list,
             );
             let result = self
-                .execute_runtime_script_bounded("<callFnByValue>", code, await_timeout_ms, false)
+                .execute_runtime_script_bounded(
+                    "<callFnByValue>",
+                    code,
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
+                )
                 .map_err(|e| format!("JS error: {}", e))?;
-            let json_val = self.v8_to_json(result)?;
+            let json_val = self.v8_to_json_bounded(
+                result,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )?;
             return Ok(Self::info_from_json(&json_val));
         }
 
@@ -1957,9 +1982,18 @@ impl ObscuraJsRuntime {
             meta_fn = Self::meta_extract_js("__result"),
         );
         let result = self
-            .execute_runtime_script_bounded("<callFnRemote>", code, await_timeout_ms, false)
+            .execute_runtime_script_bounded(
+                "<callFnRemote>",
+                code,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )
             .map_err(|e| format!("JS error: {}", e))?;
-        let meta_str = self.v8_to_json(result)?;
+        let meta_str = self.v8_to_json_bounded(
+            result,
+            Self::cdp_remaining_budget_ms(cdp_deadline),
+            false,
+        )?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str.clone())
         } else {
@@ -3369,7 +3403,7 @@ impl ObscuraJsRuntime {
 
             let s = local.to_rust_string_lossy(scope);
             Ok(serde_json::Value::String(s))
-    
+
         })();
         if crate::cdp_watchdog::disarm(watchdog) {
             self.cancel_termination();
