@@ -150,7 +150,20 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    /// Watchdog terminations so far. Past TERMINATION_LATCH_THRESHOLD the page
+    /// is declared pathological: it livelocks in bursts (terminate -> revive ->
+    /// re-loop), so every later JS entry becomes a no-op and the render
+    /// completes capped instead of cycling until the hard deadline.
+    termination_count: std::cell::Cell<u32>,
 }
+
+/// Terminations before the page's JS is disabled for the rest of the render.
+const TERMINATION_LATCH_THRESHOLD: u32 = 3;
+
+/// Default ceiling for one uninterrupted internal JS task: the synchronous
+/// task floor plus the watchdog scheduling margin. Callers with their own
+/// timeout (CDP Runtime.evaluate) arm the watchdog from that instead.
+const INTERNAL_TASK_WATCHDOG_MS: u64 = SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
 
 /// Renders a caught V8 exception as a message for realm evaluation errors.
 fn exception_text(
@@ -360,6 +373,7 @@ impl ObscuraJsRuntime {
             module_load_activity,
             isolate_handle,
             heap_limit_state,
+            termination_count: std::cell::Cell::new(0),
             module_evaluations: HashMap::new(),
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
@@ -509,22 +523,47 @@ impl ObscuraJsRuntime {
         source: &str,
     ) -> Result<String, String> {
         use deno_core::v8;
-
-        let isolate = self.runtime.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
-        let context = v8::Local::new(scope, realm);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        let scope = &mut v8::TryCatch::new(scope);
-
-        let code = v8::String::new(scope, source).ok_or("source too large")?;
-        let script = match v8::Script::compile(scope, code, None) {
-            Some(script) => script,
-            None => return Err(exception_text(scope)),
-        };
-        match script.run(scope) {
-            Some(value) => Ok(value.to_rust_string_lossy(scope)),
-            None => Err(exception_text(scope)),
+        if self.js_latched_off() {
+            return Ok(String::new());
         }
+
+        // Frame scripts run page JS too (advance_frames drives iframe
+        // preload/document/load-handler code through here, outside any
+        // event-loop watchdog), so bound them like every other entry point.
+        // The token is scoped to the V8 borrow so disarm can touch `self`.
+        let isolate_handle = self.isolate_handle();
+        let (watchdog, result) = {
+            let isolate = self.runtime.v8_isolate();
+            let scope = &mut v8::HandleScope::new(isolate);
+            let context = v8::Local::new(scope, realm);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let scope = &mut v8::TryCatch::new(scope);
+
+            // Armed before compilation: a large or adversarial frame source
+            // can monopolize V8 while compiling, not only while running.
+            let watchdog = crate::cdp_watchdog::arm(
+                isolate_handle,
+                std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
+            );
+            let run_attempt = v8::String::new(scope, source)
+                .ok_or("source too large".to_string())
+                .and_then(|code| match v8::Script::compile(scope, code, None) {
+                    Some(script) => Ok(script.run(scope)),
+                    None => Err(exception_text(scope)),
+                });
+            let result = match run_attempt {
+                Ok(Some(value)) => Ok(value.to_rust_string_lossy(scope)),
+                Ok(None) => Err(exception_text(scope)),
+                Err(error) => Err(error),
+            };
+            (watchdog, result)
+        };
+        if crate::cdp_watchdog::disarm(watchdog) {
+            self.cancel_termination();
+            self.note_termination();
+            return Err("frame script exceeded its task budget; execution terminated".to_string());
+        }
+        result
     }
 
     /// Copies the browser-identity globals from the main realm into `realm`.
@@ -771,10 +810,41 @@ impl ObscuraJsRuntime {
         name: &'static str,
         source: String,
     ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        self.execute_runtime_script_bounded(name, source, INTERNAL_TASK_WATCHDOG_MS, true)
+    }
+
+    /// Execute a script with the shared watchdog armed for `budget_ms` and
+    /// the page-pathology latch honored. Script::Run ends with a microtask
+    /// checkpoint that drains page promise jobs, so even a trivial-looking
+    /// internal script can run arbitrary page JS — every runtime script goes
+    /// through here. `count_toward_latch` is false for CDP client
+    /// expressions: a client evaluating `while(true){}` says nothing about
+    /// the page's own health.
+    fn execute_runtime_script_bounded(
+        &mut self,
+        name: &'static str,
+        source: String,
+        budget_ms: u64,
+        count_toward_latch: bool,
+    ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        if self.js_latched_off() {
+            return Err("page JS latched off after repeated terminations".to_string());
+        }
+        let watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(budget_ms),
+        );
         let result = self
             .runtime
             .execute_script(name, source)
             .map_err(|error| error.to_string());
+        if crate::cdp_watchdog::disarm(watchdog) {
+            self.cancel_termination();
+            if count_toward_latch {
+                self.note_termination();
+            }
+            return Err("script exceeded its task budget; execution terminated".to_string());
+        }
         self.finish_heap_checked(result)
     }
 
@@ -1451,12 +1521,36 @@ impl ObscuraJsRuntime {
     }
 
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        self.evaluate_with_budget(expression, INTERNAL_TASK_WATCHDOG_MS, true)
+    }
+
+    fn evaluate_with_budget(
+        &mut self,
+        expression: &str,
+        budget_ms: u64,
+        count_toward_latch: bool,
+    ) -> Result<serde_json::Value, String> {
+        if self.js_latched_off() {
+            // Internal probes degrade quietly so the capped render can
+            // finish; CDP clients get the same explicit error as every
+            // other CDP path instead of a flag-dependent silent null.
+            return if count_toward_latch {
+                Ok(serde_json::Value::Null)
+            } else {
+                Err("page JS latched off after repeated terminations".to_string())
+            };
+        }
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
-        let result = self
-            .execute_runtime_script("<eval>", wrapped)
-            .map_err(|e| format!("JS error: {}", e))?;
-        self.v8_to_json(result)
+        // A probe's own script is trivial, but Script::Run ends with a
+        // microtask checkpoint that drains page promise jobs — a page
+        // livelocked in a retry loop spins there with no outer watchdog
+        // armed, wedging the render thread (observed: Shopify product pages
+        // via has_pending_load_delaying_scripts between event-loop ticks).
+        let result =
+            self.execute_runtime_script_bounded("<eval>", wrapped, budget_ms, count_toward_latch);
+        let result = result.map_err(|e| format!("JS error: {}", e))?;
+        self.v8_to_json_bounded(result, budget_ms, count_toward_latch)
     }
 
     pub async fn evaluate_for_cdp(
@@ -1481,8 +1575,28 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
+        // One absolute deadline for the whole request: execution draws its
+        // remainder and serialization draws what is left after that, never
+        // the full timeout twice.
+        let cdp_deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(await_timeout_ms);
         if !await_promise && return_by_value {
-            let val = self.evaluate(expression)?;
+            // The caller asked for this timeout; a fixed internal ceiling
+            // would silently replace it and tokio cannot preempt sync V8.
+            let wrapped = Self::wrap_expression(expression);
+            let result = self
+                .execute_runtime_script_bounded(
+                    "<eval>",
+                    wrapped,
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
+                )
+                .map_err(|e| format!("JS error: {}", e))?;
+            let val = self.v8_to_json_bounded(
+                result,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )?;
             return Ok(Self::info_from_json(&val));
         }
         self.begin_javascript_task();
@@ -1539,22 +1653,42 @@ impl ObscuraJsRuntime {
         };
 
         let result = self
-            .execute_runtime_script("<eval-remote>", meta_code)
+            .execute_runtime_script_bounded(
+                "<eval-remote>",
+                meta_code,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )
             .map_err(|e| format!("JS error: {}", e))?;
 
         let meta_str = if await_promise {
             let __t0 = std::time::Instant::now();
+            let settle_deadline = cdp_deadline;
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
             let settled = self
                 .resolve_promises_until(
                     |rt| {
-                        rt.execute_runtime_script("<done?>", sentinel.clone())
-                            .ok()
-                            .and_then(|v| rt.v8_to_json(v).ok())
-                            .and_then(|j| j.as_bool())
-                            .unwrap_or(false)
+                        let budget_ms = settle_deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis()
+                            .min(INTERNAL_TASK_WATCHDOG_MS as u128)
+                            .max(1) as u64;
+                        rt.execute_runtime_script_bounded(
+                            "<done?>",
+                            sentinel.clone(),
+                            budget_ms,
+                            false,
+                        )
+                        .ok()
+                        .and_then(|v| rt.v8_to_json(v).ok())
+                        .and_then(|j| j.as_bool())
+                        .unwrap_or(false)
                     },
-                    await_timeout_ms,
+                    cdp_deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis()
+                        .max(1) as u64,
+                    false,
                 )
                 .await;
             if !settled {
@@ -1576,25 +1710,39 @@ impl ObscuraJsRuntime {
                 );
             }
             let rejected = self
-                .execute_runtime_script(
+                .execute_runtime_script_bounded(
                     "<readRejected>",
                     "globalThis.__obscura_await_rejected".to_string(),
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
-            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                let err = self.execute_runtime_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
+            if self
+                .v8_to_json_bounded(rejected, Self::cdp_remaining_budget_ms(cdp_deadline), false)?
+                .as_bool()
+                .unwrap_or(false)
+            {
+                let err = self.execute_runtime_script_bounded("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid), Self::cdp_remaining_budget_ms(cdp_deadline), false)
                     .map_err(|e| format!("JS error: {}", e))?;
                 return Err(format!(
                     "Promise rejected: {}",
-                    self.v8_to_json(err)?.as_str().unwrap_or("")
+                    self.v8_to_json_bounded(err, Self::cdp_remaining_budget_ms(cdp_deadline), false)?
+                        .as_str()
+                        .unwrap_or("")
                 ));
             }
-            self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-                .map_err(|e| format!("JS error: {}", e))?
+            self.execute_runtime_script_bounded(
+                "<readMeta>",
+                "globalThis.__obscura_await_meta".to_string(),
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )
+            .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
         };
-        let meta_str = self.v8_to_json(meta_str)?;
+        let meta_str =
+            self.v8_to_json_bounded(meta_str, Self::cdp_remaining_budget_ms(cdp_deadline), false)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str)
         } else {
@@ -1607,12 +1755,15 @@ impl ObscuraJsRuntime {
 
         if await_promise && return_by_value {
             let read = self
-                .execute_runtime_script(
+                .execute_runtime_script_bounded(
                     "<readResult>",
                     format!("globalThis.__obscura_objects['{}']", oid),
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
-            let json_val = self.v8_to_json(read)?;
+            let json_val =
+                self.v8_to_json_bounded(read, Self::cdp_remaining_budget_ms(cdp_deadline), false)?;
             return Ok(Self::info_from_json(&json_val));
         }
 
@@ -1648,6 +1799,8 @@ impl ObscuraJsRuntime {
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
         self.begin_javascript_task();
+        let cdp_deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(await_timeout_ms);
         let this_expr = self.resolve_this(object_id);
         let (setup, args_list) = self.build_args(arguments);
 
@@ -1685,21 +1838,41 @@ impl ObscuraJsRuntime {
                 done_counter = done_counter,
             );
 
-            self.execute_runtime_script("<callFnAsync>", code)
-                .map_err(|e| format!("JS error: {}", e))?;
+            self.execute_runtime_script_bounded(
+                "<callFnAsync>",
+                code,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )
+            .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
+            let settle_deadline = cdp_deadline;
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
             let settled = self
                 .resolve_promises_until(
                     |rt| {
-                        rt.execute_runtime_script("<done?>", sentinel.clone())
-                            .ok()
-                            .and_then(|v| rt.v8_to_json(v).ok())
-                            .and_then(|j| j.as_bool())
-                            .unwrap_or(false)
+                        let budget_ms = settle_deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis()
+                            .min(INTERNAL_TASK_WATCHDOG_MS as u128)
+                            .max(1) as u64;
+                        rt.execute_runtime_script_bounded(
+                            "<done?>",
+                            sentinel.clone(),
+                            budget_ms,
+                            false,
+                        )
+                        .ok()
+                        .and_then(|v| rt.v8_to_json(v).ok())
+                        .and_then(|j| j.as_bool())
+                        .unwrap_or(false)
                     },
-                    await_timeout_ms,
+                    cdp_deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis()
+                        .max(1) as u64,
+                    false,
                 )
                 .await;
             if !settled {
@@ -1723,19 +1896,34 @@ impl ObscuraJsRuntime {
 
             if return_by_value {
                 let read = self
-                    .execute_runtime_script(
+                    .execute_runtime_script_bounded(
                         "<readResult>",
                         format!("globalThis.__obscura_objects['{}']", oid),
+                        Self::cdp_remaining_budget_ms(cdp_deadline),
+                        false,
                     )
                     .map_err(|e| format!("JS error: {}", e))?;
-                let json_val = self.v8_to_json(read)?;
+                let json_val = self.v8_to_json_bounded(
+                    read,
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
+                )?;
                 return Ok(Self::info_from_json(&json_val));
             }
 
             let meta_result = self
-                .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+                .execute_runtime_script_bounded(
+                    "<readMeta>",
+                    "globalThis.__obscura_await_meta".to_string(),
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
+                )
                 .map_err(|e| format!("JS error: {}", e))?;
-            let meta_str = self.v8_to_json(meta_result)?;
+            let meta_str = self.v8_to_json_bounded(
+                meta_result,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
                 serde_json::from_str(s).unwrap_or(meta_str.clone())
             } else {
@@ -1762,9 +1950,18 @@ impl ObscuraJsRuntime {
                 args = args_list,
             );
             let result = self
-                .execute_runtime_script("<callFnByValue>", code)
+                .execute_runtime_script_bounded(
+                    "<callFnByValue>",
+                    code,
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
+                )
                 .map_err(|e| format!("JS error: {}", e))?;
-            let json_val = self.v8_to_json(result)?;
+            let json_val = self.v8_to_json_bounded(
+                result,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )?;
             return Ok(Self::info_from_json(&json_val));
         }
 
@@ -1785,9 +1982,18 @@ impl ObscuraJsRuntime {
             meta_fn = Self::meta_extract_js("__result"),
         );
         let result = self
-            .execute_runtime_script("<callFnRemote>", code)
+            .execute_runtime_script_bounded(
+                "<callFnRemote>",
+                code,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )
             .map_err(|e| format!("JS error: {}", e))?;
-        let meta_str = self.v8_to_json(result)?;
+        let meta_str = self.v8_to_json_bounded(
+            result,
+            Self::cdp_remaining_budget_ms(cdp_deadline),
+            false,
+        )?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str.clone())
         } else {
@@ -2093,6 +2299,9 @@ impl ObscuraJsRuntime {
         prepared: PreparedModule,
         budget_ms: u64,
     ) -> Result<(), String> {
+        if self.js_latched_off() {
+            return Ok(());
+        }
         let PreparedModule {
             module_id,
             description,
@@ -2136,6 +2345,9 @@ impl ObscuraJsRuntime {
     }
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        if self.js_latched_off() {
+            return Ok(());
+        }
         self.begin_javascript_task();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
@@ -2202,11 +2414,24 @@ impl ObscuraJsRuntime {
     }
 
     pub fn execute_script_guarded(&mut self, name: &str, source: &str) -> Result<(), String> {
-        if source.len() < 10_000 {
-            self.execute_script(name, source)
-        } else {
-            self.execute_script_with_timeout(name, source, std::time::Duration::from_secs(5))
+        // Source length says nothing about execution time; guard every
+        // classic script with the shared (cheap) watchdog. A killed script
+        // is tolerated, matching the old 5s-timeout behavior.
+        if self.js_latched_off() {
+            return Ok(());
         }
+        let watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
+        );
+        let result = self.execute_classic_script(name, source);
+        if crate::cdp_watchdog::disarm(watchdog) {
+            self.cancel_termination();
+            self.note_termination();
+            tracing::warn!("Script killed after exceeding its task budget");
+            return Ok(());
+        }
+        result
     }
 
     pub fn execute_script_with_timeout(
@@ -2258,6 +2483,7 @@ impl ObscuraJsRuntime {
             Ok(()) => Ok(()),
             Err(msg) => {
                 if msg.contains("Uncaught Error: execution terminated") {
+                    self.note_termination();
                     tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
                     Ok(())
                 } else {
@@ -2268,12 +2494,22 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
+        if self.js_latched_off() {
+            return Ok(());
+        }
         self.begin_javascript_task();
         // A browser performs a microtask checkpoint at the end of each task.
         // deno_core's event loop may return immediately when no async op is
         // pending, leaving an already-resolved Promise continuation stranded
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
+        // Bounded like the cooperative tick: callers wrap this in a tokio
+        // timeout, which cannot preempt a synchronous page-JS burst (the
+        // network-idle wait wedges there otherwise).
+        let watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
+        );
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         let result = self
             .runtime
@@ -2281,6 +2517,12 @@ impl ObscuraJsRuntime {
             .await
             .map_err(|e| format!("Event loop error: {}", e));
         self.runtime.v8_isolate().perform_microtask_checkpoint();
+        let fired = crate::cdp_watchdog::disarm(watchdog);
+        if fired {
+            self.cancel_termination();
+            self.note_termination();
+            return Err("event-loop drain exceeded its task budget; execution terminated".into());
+        }
         self.finish_heap_checked(result)
     }
 
@@ -2358,9 +2600,41 @@ impl ObscuraJsRuntime {
         let fired = token.stop();
         if fired {
             self.runtime.v8_isolate().cancel_terminate_execution();
+            self.note_termination();
             tracing::warn!("V8 watchdog fired: terminated a synchronous overrun");
         }
         fired
+    }
+
+    /// Record one watchdog termination and return whether the page's JS is
+    /// now latched off for the rest of the render.
+    fn note_termination(&self) -> bool {
+        let n = self.termination_count.get() + 1;
+        self.termination_count.set(n);
+        if n == TERMINATION_LATCH_THRESHOLD {
+            tracing::warn!(
+                "page JS disabled after {n} watchdog terminations; render will complete capped"
+            );
+        }
+        n >= TERMINATION_LATCH_THRESHOLD
+    }
+
+    /// True once the page has tripped enough watchdogs that running more of
+    /// its JS can only re-livelock. Checked at every JS entry point.
+    pub fn js_latched_off(&self) -> bool {
+        self.termination_count.get() >= TERMINATION_LATCH_THRESHOLD
+    }
+
+    /// Remaining watchdog budget against one absolute CDP deadline, capped at
+    /// the internal ceiling. Every V8 entry of a CDP request (initial
+    /// evaluation, settlement pumping, sentinel and result reads) draws from
+    /// the same deadline so the caller's timeout is end-to-end, not per phase.
+    fn cdp_remaining_budget_ms(deadline: tokio::time::Instant) -> u64 {
+        deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis()
+            .min(INTERNAL_TASK_WATCHDOG_MS as u128)
+            .max(1) as u64
     }
 
     /// This runtime's V8 isolate handle (captured at construction, stable for
@@ -2375,6 +2649,27 @@ impl ObscuraJsRuntime {
     /// No-op when the isolate is not terminating.
     pub fn cancel_termination(&mut self) {
         self.runtime.v8_isolate().cancel_terminate_execution();
+    }
+
+    /// Suppress V8's automatic microtask drains for a stretch of internal API
+    /// manipulation. Every `v8::Object::Set` fires the isolate's call-completed
+    /// callback, which runs the page's queued microtasks — internal engine
+    /// work (realm setup, shim installation) must never execute page JS: a
+    /// pathological page's queued microtasks livelock there, bypassing every
+    /// script-entry watchdog (observed: iframe realm attach on Shopify pages).
+    /// Explicit policy means microtasks run only via deliberate
+    /// `perform_microtask_checkpoint` calls. Pair with [`Self::restore_microtasks`].
+    pub(crate) fn suppress_microtasks(&mut self) -> deno_core::v8::MicrotasksPolicy {
+        let isolate = self.runtime.v8_isolate();
+        let previous = isolate.get_microtasks_policy();
+        isolate.set_microtasks_policy(deno_core::v8::MicrotasksPolicy::Explicit);
+        previous
+    }
+
+    pub(crate) fn restore_microtasks(&mut self, previous: deno_core::v8::MicrotasksPolicy) {
+        self.runtime
+            .v8_isolate()
+            .set_microtasks_policy(previous);
     }
 
     /// Drive the event loop for at most `budget_ms`, bounded against BOTH async
@@ -2426,7 +2721,13 @@ impl ObscuraJsRuntime {
         let fired = self.disarm_watchdog(token);
         match result {
             Err(error) if error.contains("heap limit exceeded") => Err(error),
-            Err(error) if fired || error.contains("execution terminated") => Ok(()),
+            Err(error)
+                if fired
+                    || error.contains("execution terminated")
+                    || error.contains("exceeded its task budget") =>
+            {
+                Ok(())
+            }
             other => other,
         }
     }
@@ -2460,13 +2761,45 @@ impl ObscuraJsRuntime {
     /// ready, it remains parked on deno_core's real I/O/timer waker, so the
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
+        // One event-loop turn can synchronously drain an arbitrarily long
+        // chain of timer/microtask callbacks; tokio's timeout cannot preempt
+        // that native V8 call. Bound the synchronous entry the same way the
+        // autonomous turn does, or a page whose timer callback loops forever
+        // wedges the render thread past every outer deadline (observed:
+        // Shopify product pages livelocking in a jQuery re-eval handler).
+        const TICK_TASK_WATCHDOG_MS: u64 = INTERNAL_TASK_WATCHDOG_MS;
+        if self.js_latched_off() {
+            return Ok(true);
+        }
         self.begin_javascript_task();
+        let checkpoint_watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(TICK_TASK_WATCHDOG_MS),
+        );
         self.runtime.v8_isolate().perform_microtask_checkpoint();
+        if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
+            self.cancel_termination();
+            self.note_termination();
+            return Err("cooperative tick microtask checkpoint exceeded its task budget".into());
+        }
+        let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
+            let watchdog = crate::cdp_watchdog::arm(
+                isolate_handle.clone(),
+                std::time::Duration::from_millis(TICK_TASK_WATCHDOG_MS),
+            );
             let tick = self
                 .runtime
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
+            if watchdog_fired {
+                self.runtime.v8_isolate().cancel_terminate_execution();
+                self.note_termination();
+                return std::task::Poll::Ready(Err(
+                    "cooperative event-loop task exceeded its task budget".into(),
+                ));
+            }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
@@ -2500,6 +2833,9 @@ impl ObscuraJsRuntime {
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
         const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
+        if self.js_latched_off() {
+            return Ok(true);
+        }
 
         self.begin_javascript_task();
 
@@ -2510,6 +2846,7 @@ impl ObscuraJsRuntime {
         self.runtime.v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
             self.cancel_termination();
+            self.note_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
         }
         if self.recover_heap_limit() {
@@ -2529,6 +2866,7 @@ impl ObscuraJsRuntime {
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
                 self.runtime.v8_isolate().cancel_terminate_execution();
+                self.note_termination();
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
                 ));
@@ -2680,7 +3018,13 @@ impl ObscuraJsRuntime {
         let fired = self.disarm_watchdog(token);
         match result {
             Err(error) if error.contains("heap limit exceeded") => Err(error),
-            Err(error) if fired || error.contains("execution terminated") => Ok(()),
+            Err(error)
+                if fired
+                    || error.contains("execution terminated")
+                    || error.contains("exceeded its task budget") =>
+            {
+                Ok(())
+            }
             other => other,
         }
     }
@@ -2718,18 +3062,6 @@ impl ObscuraJsRuntime {
         }
     }
 
-    pub async fn resolve_promises(&mut self) {
-        self.begin_javascript_task();
-        // Default settle: just pump until idle or 5s.
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            self.runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default()),
-        )
-        .await;
-        self.recover_heap_limit();
-    }
-
     /// Pump the event loop until `done_check` returns true (e.g. an IIFE
     /// has written its result sentinel), or `max_total_ms` elapses. Returns
     /// whether the predicate completed before the deadline.
@@ -2746,6 +3078,7 @@ impl ObscuraJsRuntime {
         &mut self,
         mut done_check: F,
         max_total_ms: u64,
+        count_toward_latch: bool,
     ) -> bool
     where
         F: FnMut(&mut Self) -> bool,
@@ -2753,6 +3086,9 @@ impl ObscuraJsRuntime {
         let deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_total_ms);
         let mut tick_ms: u64 = 1;
+        if self.js_latched_off() {
+            return false;
+        }
         loop {
             self.begin_javascript_task();
             if done_check(self) {
@@ -2763,12 +3099,32 @@ impl ObscuraJsRuntime {
             }
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
+            // Guard the slice: tokio's timeout cannot preempt synchronous
+            // page JS running inside the pump. Bound it by the remaining
+            // caller budget, capped at the internal ceiling, so a short
+            // caller timeout is honored even against a microtask livelock.
+            let pump_budget_ms = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(INTERNAL_TASK_WATCHDOG_MS as u128)
+                .max(1) as u64;
+            let pump_watchdog = crate::cdp_watchdog::arm(
+                self.isolate_handle(),
+                std::time::Duration::from_millis(pump_budget_ms),
+            );
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_millis(tick_ms),
                 self.runtime
                     .run_event_loop(deno_core::PollEventLoopOptions::default()),
             )
             .await;
+            if crate::cdp_watchdog::disarm(pump_watchdog) {
+                self.cancel_termination();
+                if count_toward_latch {
+                    self.note_termination();
+                }
+                return false;
+            }
             if self.recover_heap_limit() {
                 return false;
             }
@@ -2981,47 +3337,83 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
-        let scope = &mut self.runtime.handle_scope();
-        let local = deno_core::v8::Local::new(scope, result);
+        self.v8_to_json_bounded(result, INTERNAL_TASK_WATCHDOG_MS, true)
+    }
 
-        if local.is_undefined() || local.is_null() {
+    /// Serialize with the caller's budget and latch policy. CDP result reads
+    /// draw the request's absolute deadline and never charge the page latch;
+    /// internal evaluation uses the defaults via [`Self::v8_to_json`].
+    fn v8_to_json_bounded(
+        &mut self,
+        result: deno_core::v8::Global<deno_core::v8::Value>,
+        budget_ms: u64,
+        count_toward_latch: bool,
+    ) -> Result<serde_json::Value, String> {
+        // Serializing the result can execute page code: JSON.stringify is a
+        // mutable page global (overridable with an infinite loop), and both
+        // toJSON hooks and the to_rust_string_lossy fallback invoke user
+        // functions. The surrounding eval watchdog has disarmed by now, so
+        // guard serialization itself.
+        if self.js_latched_off() {
             return Ok(serde_json::Value::Null);
         }
-        if local.is_boolean() {
-            return Ok(serde_json::Value::Bool(local.boolean_value(scope)));
-        }
-        if local.is_number() {
-            let n = local.number_value(scope).unwrap_or(0.0);
-            return Ok(serde_json::json!(n));
-        }
-        if local.is_string() {
-            let s = local.to_rust_string_lossy(scope);
-            return Ok(serde_json::Value::String(s));
-        }
+        let watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(budget_ms),
+        );
+        let out = (|| {
+            let scope = &mut self.runtime.handle_scope();
+            let local = deno_core::v8::Local::new(scope, result);
 
-        let global = scope.get_current_context().global(scope);
-        let json_obj_str = deno_core::v8::String::new(scope, "JSON").unwrap();
-        if let Some(json_obj) = global.get(scope, json_obj_str.into()) {
-            if let Some(json_obj) = json_obj.to_object(scope) {
-                let stringify_str = deno_core::v8::String::new(scope, "stringify").unwrap();
-                if let Some(stringify_fn) = json_obj.get(scope, stringify_str.into()) {
-                    if let Ok(stringify_fn) =
-                        deno_core::v8::Local::<deno_core::v8::Function>::try_from(stringify_fn)
-                    {
-                        let args = [local];
-                        if let Some(result) = stringify_fn.call(scope, json_obj.into(), &args) {
-                            let json_str = result.to_rust_string_lossy(scope);
-                            if let Ok(val) = serde_json::from_str(&json_str) {
-                                return Ok(val);
+            if local.is_undefined() || local.is_null() {
+                return Ok(serde_json::Value::Null);
+            }
+            if local.is_boolean() {
+                return Ok(serde_json::Value::Bool(local.boolean_value(scope)));
+            }
+            if local.is_number() {
+                let n = local.number_value(scope).unwrap_or(0.0);
+                return Ok(serde_json::json!(n));
+            }
+            if local.is_string() {
+                let s = local.to_rust_string_lossy(scope);
+                return Ok(serde_json::Value::String(s));
+            }
+
+            let global = scope.get_current_context().global(scope);
+            let json_obj_str = deno_core::v8::String::new(scope, "JSON").unwrap();
+            if let Some(json_obj) = global.get(scope, json_obj_str.into()) {
+                if let Some(json_obj) = json_obj.to_object(scope) {
+                    let stringify_str = deno_core::v8::String::new(scope, "stringify").unwrap();
+                    if let Some(stringify_fn) = json_obj.get(scope, stringify_str.into()) {
+                        if let Ok(stringify_fn) =
+                            deno_core::v8::Local::<deno_core::v8::Function>::try_from(stringify_fn)
+                        {
+                            let args = [local];
+                            if let Some(result) = stringify_fn.call(scope, json_obj.into(), &args) {
+                                let json_str = result.to_rust_string_lossy(scope);
+                                if let Ok(val) = serde_json::from_str(&json_str) {
+                                    return Ok(val);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        let s = local.to_rust_string_lossy(scope);
-        Ok(serde_json::Value::String(s))
+            let s = local.to_rust_string_lossy(scope);
+            Ok(serde_json::Value::String(s))
+
+        })();
+        if crate::cdp_watchdog::disarm(watchdog) {
+            self.cancel_termination();
+            if count_toward_latch {
+                self.note_termination();
+            }
+            return Err("result serialization exceeded its task budget; execution terminated"
+                .to_string());
+        }
+        out
     }
 
     fn info_from_json(value: &serde_json::Value) -> RemoteObjectInfo {

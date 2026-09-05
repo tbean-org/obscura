@@ -256,8 +256,12 @@ pub struct DomTree {
 /// it saturating the engine thread.
 pub(crate) struct AttrIndexCache {
     pub(crate) gen: u64,
-    pub(crate) map: HashMap<String, Vec<NodeId>>,
-    pub(crate) tag_map: HashMap<String, Vec<NodeId>>,
+    pub(crate) map: HashMap<LocalName, Vec<NodeId>>,
+    pub(crate) tag_map: HashMap<LocalName, Vec<NodeId>>,
+    /// Document-order sequence per arena slot (u32::MAX outside the document
+    /// tree, e.g. detached or shadow nodes). Rebuilt with the index so query
+    /// results sort in document order without per-query tree walks.
+    pub(crate) order: Vec<u32>,
 }
 
 pub(crate) struct DomTreeInner {
@@ -267,6 +271,13 @@ pub(crate) struct DomTreeInner {
     pub(crate) id_index: HashMap<String, NodeId>,
     pub(crate) mutation_gen: std::cell::Cell<u64>,
     pub(crate) attr_index: RefCell<Option<AttrIndexCache>>,
+    /// (queries, rebuilds) for the selector index's adaptive cutoff, and the
+    /// cutoff itself: a page mutating between nearly every query pays a full
+    /// index rebuild per query, which is worse than the plain descendant
+    /// scan, so the fast path switches off for such pages (correctness is
+    /// unchanged — the fallback sees the live tree either way).
+    pub(crate) attr_index_stats: std::cell::Cell<(u64, u64)>,
+    pub(crate) attr_index_disabled: std::cell::Cell<bool>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
     /// into a shadow tree by accident.
@@ -300,6 +311,8 @@ impl DomTree {
                 id_index: HashMap::new(),
                 mutation_gen: std::cell::Cell::new(0),
                 attr_index: RefCell::new(None),
+                attr_index_stats: std::cell::Cell::new((0, 0)),
+                attr_index_disabled: std::cell::Cell::new(false),
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
