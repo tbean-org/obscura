@@ -3012,18 +3012,6 @@ impl ObscuraJsRuntime {
         }
     }
 
-    pub async fn resolve_promises(&mut self) {
-        self.begin_javascript_task();
-        // Default settle: just pump until idle or 5s.
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            self.runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default()),
-        )
-        .await;
-        self.recover_heap_limit();
-    }
-
     /// Pump the event loop until `done_check` returns true (e.g. an IIFE
     /// has written its result sentinel), or `max_total_ms` elapses. Returns
     /// whether the predicate completed before the deadline.
@@ -3299,47 +3287,69 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
-        let scope = &mut self.runtime.handle_scope();
-        let local = deno_core::v8::Local::new(scope, result);
-
-        if local.is_undefined() || local.is_null() {
+        // Serializing the result can execute page code: JSON.stringify is a
+        // mutable page global (overridable with an infinite loop), and both
+        // toJSON hooks and the to_rust_string_lossy fallback invoke user
+        // functions. The surrounding eval watchdog has disarmed by now, so
+        // guard serialization itself.
+        if self.js_latched_off() {
             return Ok(serde_json::Value::Null);
         }
-        if local.is_boolean() {
-            return Ok(serde_json::Value::Bool(local.boolean_value(scope)));
-        }
-        if local.is_number() {
-            let n = local.number_value(scope).unwrap_or(0.0);
-            return Ok(serde_json::json!(n));
-        }
-        if local.is_string() {
-            let s = local.to_rust_string_lossy(scope);
-            return Ok(serde_json::Value::String(s));
-        }
+        let watchdog = crate::cdp_watchdog::arm(
+            self.isolate_handle(),
+            std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
+        );
+        let out = (|| {
+            let scope = &mut self.runtime.handle_scope();
+            let local = deno_core::v8::Local::new(scope, result);
 
-        let global = scope.get_current_context().global(scope);
-        let json_obj_str = deno_core::v8::String::new(scope, "JSON").unwrap();
-        if let Some(json_obj) = global.get(scope, json_obj_str.into()) {
-            if let Some(json_obj) = json_obj.to_object(scope) {
-                let stringify_str = deno_core::v8::String::new(scope, "stringify").unwrap();
-                if let Some(stringify_fn) = json_obj.get(scope, stringify_str.into()) {
-                    if let Ok(stringify_fn) =
-                        deno_core::v8::Local::<deno_core::v8::Function>::try_from(stringify_fn)
-                    {
-                        let args = [local];
-                        if let Some(result) = stringify_fn.call(scope, json_obj.into(), &args) {
-                            let json_str = result.to_rust_string_lossy(scope);
-                            if let Ok(val) = serde_json::from_str(&json_str) {
-                                return Ok(val);
+            if local.is_undefined() || local.is_null() {
+                return Ok(serde_json::Value::Null);
+            }
+            if local.is_boolean() {
+                return Ok(serde_json::Value::Bool(local.boolean_value(scope)));
+            }
+            if local.is_number() {
+                let n = local.number_value(scope).unwrap_or(0.0);
+                return Ok(serde_json::json!(n));
+            }
+            if local.is_string() {
+                let s = local.to_rust_string_lossy(scope);
+                return Ok(serde_json::Value::String(s));
+            }
+
+            let global = scope.get_current_context().global(scope);
+            let json_obj_str = deno_core::v8::String::new(scope, "JSON").unwrap();
+            if let Some(json_obj) = global.get(scope, json_obj_str.into()) {
+                if let Some(json_obj) = json_obj.to_object(scope) {
+                    let stringify_str = deno_core::v8::String::new(scope, "stringify").unwrap();
+                    if let Some(stringify_fn) = json_obj.get(scope, stringify_str.into()) {
+                        if let Ok(stringify_fn) =
+                            deno_core::v8::Local::<deno_core::v8::Function>::try_from(stringify_fn)
+                        {
+                            let args = [local];
+                            if let Some(result) = stringify_fn.call(scope, json_obj.into(), &args) {
+                                let json_str = result.to_rust_string_lossy(scope);
+                                if let Ok(val) = serde_json::from_str(&json_str) {
+                                    return Ok(val);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        let s = local.to_rust_string_lossy(scope);
-        Ok(serde_json::Value::String(s))
+            let s = local.to_rust_string_lossy(scope);
+            Ok(serde_json::Value::String(s))
+    
+        })();
+        if crate::cdp_watchdog::disarm(watchdog) {
+            self.cancel_termination();
+            self.note_termination();
+            return Err("result serialization exceeded its task budget; execution terminated"
+                .to_string());
+        }
+        out
     }
 
     fn info_from_json(value: &serde_json::Value) -> RemoteObjectInfo {
