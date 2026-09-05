@@ -1634,14 +1634,20 @@ impl ObscuraJsRuntime {
             )
         };
 
+        let cdp_deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(await_timeout_ms);
         let result = self
-            .execute_runtime_script_bounded("<eval-remote>", meta_code, await_timeout_ms, false)
+            .execute_runtime_script_bounded(
+                "<eval-remote>",
+                meta_code,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )
             .map_err(|e| format!("JS error: {}", e))?;
 
         let meta_str = if await_promise {
             let __t0 = std::time::Instant::now();
-            let settle_deadline = tokio::time::Instant::now()
-                + tokio::time::Duration::from_millis(await_timeout_ms);
+            let settle_deadline = cdp_deadline;
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
             let settled = self
                 .resolve_promises_until(
@@ -1662,7 +1668,10 @@ impl ObscuraJsRuntime {
                         .and_then(|j| j.as_bool())
                         .unwrap_or(false)
                     },
-                    await_timeout_ms,
+                    cdp_deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis()
+                        .max(1) as u64,
                     false,
                 )
                 .await;
@@ -1685,21 +1694,28 @@ impl ObscuraJsRuntime {
                 );
             }
             let rejected = self
-                .execute_runtime_script(
+                .execute_runtime_script_bounded(
                     "<readRejected>",
                     "globalThis.__obscura_await_rejected".to_string(),
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
             if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                let err = self.execute_runtime_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
+                let err = self.execute_runtime_script_bounded("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid), Self::cdp_remaining_budget_ms(cdp_deadline), false)
                     .map_err(|e| format!("JS error: {}", e))?;
                 return Err(format!(
                     "Promise rejected: {}",
                     self.v8_to_json(err)?.as_str().unwrap_or("")
                 ));
             }
-            self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-                .map_err(|e| format!("JS error: {}", e))?
+            self.execute_runtime_script_bounded(
+                "<readMeta>",
+                "globalThis.__obscura_await_meta".to_string(),
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )
+            .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
         };
@@ -1716,9 +1732,11 @@ impl ObscuraJsRuntime {
 
         if await_promise && return_by_value {
             let read = self
-                .execute_runtime_script(
+                .execute_runtime_script_bounded(
                     "<readResult>",
                     format!("globalThis.__obscura_objects['{}']", oid),
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
             let json_val = self.v8_to_json(read)?;
@@ -1757,6 +1775,8 @@ impl ObscuraJsRuntime {
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
         self.begin_javascript_task();
+        let cdp_deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(await_timeout_ms);
         let this_expr = self.resolve_this(object_id);
         let (setup, args_list) = self.build_args(arguments);
 
@@ -1794,12 +1814,16 @@ impl ObscuraJsRuntime {
                 done_counter = done_counter,
             );
 
-            self.execute_runtime_script_bounded("<callFnAsync>", code, await_timeout_ms, false)
-                .map_err(|e| format!("JS error: {}", e))?;
+            self.execute_runtime_script_bounded(
+                "<callFnAsync>",
+                code,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )
+            .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
-            let settle_deadline = tokio::time::Instant::now()
-                + tokio::time::Duration::from_millis(await_timeout_ms);
+            let settle_deadline = cdp_deadline;
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
             let settled = self
                 .resolve_promises_until(
@@ -1820,7 +1844,10 @@ impl ObscuraJsRuntime {
                         .and_then(|j| j.as_bool())
                         .unwrap_or(false)
                     },
-                    await_timeout_ms,
+                    cdp_deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis()
+                        .max(1) as u64,
                     false,
                 )
                 .await;
@@ -1845,9 +1872,11 @@ impl ObscuraJsRuntime {
 
             if return_by_value {
                 let read = self
-                    .execute_runtime_script(
+                    .execute_runtime_script_bounded(
                         "<readResult>",
                         format!("globalThis.__obscura_objects['{}']", oid),
+                        Self::cdp_remaining_budget_ms(cdp_deadline),
+                        false,
                     )
                     .map_err(|e| format!("JS error: {}", e))?;
                 let json_val = self.v8_to_json(read)?;
@@ -1855,7 +1884,12 @@ impl ObscuraJsRuntime {
             }
 
             let meta_result = self
-                .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+                .execute_runtime_script_bounded(
+                    "<readMeta>",
+                    "globalThis.__obscura_await_meta".to_string(),
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
+                )
                 .map_err(|e| format!("JS error: {}", e))?;
             let meta_str = self.v8_to_json(meta_result)?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -2539,6 +2573,18 @@ impl ObscuraJsRuntime {
     /// its JS can only re-livelock. Checked at every JS entry point.
     pub fn js_latched_off(&self) -> bool {
         self.termination_count.get() >= TERMINATION_LATCH_THRESHOLD
+    }
+
+    /// Remaining watchdog budget against one absolute CDP deadline, capped at
+    /// the internal ceiling. Every V8 entry of a CDP request (initial
+    /// evaluation, settlement pumping, sentinel and result reads) draws from
+    /// the same deadline so the caller's timeout is end-to-end, not per phase.
+    fn cdp_remaining_budget_ms(deadline: tokio::time::Instant) -> u64 {
+        deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis()
+            .min(INTERNAL_TASK_WATCHDOG_MS as u128)
+            .max(1) as u64
     }
 
     /// This runtime's V8 isolate handle (captured at construction, stable for
