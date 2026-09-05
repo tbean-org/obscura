@@ -1550,7 +1550,7 @@ impl ObscuraJsRuntime {
         let result =
             self.execute_runtime_script_bounded("<eval>", wrapped, budget_ms, count_toward_latch);
         let result = result.map_err(|e| format!("JS error: {}", e))?;
-        self.v8_to_json(result)
+        self.v8_to_json_bounded(result, budget_ms, count_toward_latch)
     }
 
     pub async fn evaluate_for_cdp(
@@ -1701,12 +1701,18 @@ impl ObscuraJsRuntime {
                     false,
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
-            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
+            if self
+                .v8_to_json_bounded(rejected, Self::cdp_remaining_budget_ms(cdp_deadline), false)?
+                .as_bool()
+                .unwrap_or(false)
+            {
                 let err = self.execute_runtime_script_bounded("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid), Self::cdp_remaining_budget_ms(cdp_deadline), false)
                     .map_err(|e| format!("JS error: {}", e))?;
                 return Err(format!(
                     "Promise rejected: {}",
-                    self.v8_to_json(err)?.as_str().unwrap_or("")
+                    self.v8_to_json_bounded(err, Self::cdp_remaining_budget_ms(cdp_deadline), false)?
+                        .as_str()
+                        .unwrap_or("")
                 ));
             }
             self.execute_runtime_script_bounded(
@@ -1719,7 +1725,8 @@ impl ObscuraJsRuntime {
         } else {
             result
         };
-        let meta_str = self.v8_to_json(meta_str)?;
+        let meta_str =
+            self.v8_to_json_bounded(meta_str, Self::cdp_remaining_budget_ms(cdp_deadline), false)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str)
         } else {
@@ -1739,7 +1746,8 @@ impl ObscuraJsRuntime {
                     false,
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
-            let json_val = self.v8_to_json(read)?;
+            let json_val =
+                self.v8_to_json_bounded(read, Self::cdp_remaining_budget_ms(cdp_deadline), false)?;
             return Ok(Self::info_from_json(&json_val));
         }
 
@@ -1879,7 +1887,11 @@ impl ObscuraJsRuntime {
                         false,
                     )
                     .map_err(|e| format!("JS error: {}", e))?;
-                let json_val = self.v8_to_json(read)?;
+                let json_val = self.v8_to_json_bounded(
+                    read,
+                    Self::cdp_remaining_budget_ms(cdp_deadline),
+                    false,
+                )?;
                 return Ok(Self::info_from_json(&json_val));
             }
 
@@ -1891,7 +1903,11 @@ impl ObscuraJsRuntime {
                     false,
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
-            let meta_str = self.v8_to_json(meta_result)?;
+            let meta_str = self.v8_to_json_bounded(
+                meta_result,
+                Self::cdp_remaining_budget_ms(cdp_deadline),
+                false,
+            )?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
                 serde_json::from_str(s).unwrap_or(meta_str.clone())
             } else {
@@ -3287,6 +3303,18 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
+        self.v8_to_json_bounded(result, INTERNAL_TASK_WATCHDOG_MS, true)
+    }
+
+    /// Serialize with the caller's budget and latch policy. CDP result reads
+    /// draw the request's absolute deadline and never charge the page latch;
+    /// internal evaluation uses the defaults via [`Self::v8_to_json`].
+    fn v8_to_json_bounded(
+        &mut self,
+        result: deno_core::v8::Global<deno_core::v8::Value>,
+        budget_ms: u64,
+        count_toward_latch: bool,
+    ) -> Result<serde_json::Value, String> {
         // Serializing the result can execute page code: JSON.stringify is a
         // mutable page global (overridable with an infinite loop), and both
         // toJSON hooks and the to_rust_string_lossy fallback invoke user
@@ -3297,7 +3325,7 @@ impl ObscuraJsRuntime {
         }
         let watchdog = crate::cdp_watchdog::arm(
             self.isolate_handle(),
-            std::time::Duration::from_millis(INTERNAL_TASK_WATCHDOG_MS),
+            std::time::Duration::from_millis(budget_ms),
         );
         let out = (|| {
             let scope = &mut self.runtime.handle_scope();
@@ -3345,7 +3373,9 @@ impl ObscuraJsRuntime {
         })();
         if crate::cdp_watchdog::disarm(watchdog) {
             self.cancel_termination();
-            self.note_termination();
+            if count_toward_latch {
+                self.note_termination();
+            }
             return Err("result serialization exceeded its task budget; execution terminated"
                 .to_string());
         }
