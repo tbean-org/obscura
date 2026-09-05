@@ -60,11 +60,21 @@ impl FrameRealm {
         url: &str,
         html: &str,
     ) -> Option<Self> {
-        let context = parent.create_realm_context()?;
-        if !parent.share_ops_with_realm(&context) {
+        // Realm setup is raw V8 API work; keep the page's microtask queue
+        // out of it (see suppress_microtasks).
+        let prev = parent.suppress_microtasks();
+        let context = parent.create_realm_context();
+        let shared = context
+            .as_ref()
+            .is_some_and(|c| parent.share_ops_with_realm(c));
+        if shared {
+            parent.copy_identity_to_realm(context.as_ref().unwrap());
+        }
+        parent.restore_microtasks(prev);
+        let context = context?;
+        if !shared {
             return None;
         }
-        parent.copy_identity_to_realm(&context);
 
         // Only a same-origin frame is reachable from the page. Cross-origin
         // keeps its own security token, so V8 answers `undefined` for any
@@ -73,7 +83,9 @@ impl FrameRealm {
         let origin = origin_of(url);
         let same_origin = origin != "null" && origin == parent.page_origin();
         if same_origin {
+            let prev = parent.suppress_microtasks();
             parent.share_security_token_with_realm(&context);
+            parent.restore_microtasks(prev);
         }
 
         let mut state = ObscuraState::new();
@@ -113,7 +125,9 @@ impl FrameRealm {
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
+            let prev = parent.suppress_microtasks();
             parent.publish_realm_objects(&realm.context, frame_id);
+            parent.restore_microtasks(prev);
         }
         Some(realm)
     }
